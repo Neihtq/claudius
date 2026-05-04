@@ -1,0 +1,8 @@
+name: test-workflow
+routing:
+  channels: [email]
+  from: ["user@example.com"]
+claude:
+  system_prompt: "You are a test assistant."
+response:
+  channel: email

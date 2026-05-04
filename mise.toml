@@ -1,0 +1,16 @@
+[tools]
+uv = "latest"
+
+[tasks."docker:build"]
+run = "docker build -t claudius:latest ."
+
+[tasks."ui:build"]
+dir = "ui"
+run = "npm run build"
+
+[tasks.dev]
+depends = ["ui:build"]
+run = """
+uv run claudius serve \
+  --log-conversation
+"""

@@ -1,0 +1,37 @@
+config_dir: config/workflows
+db_path: claudius.db
+workspaces_path: data/workspaces
+image: claudius:latest
+docker_probe_mode: host_port
+host: 0.0.0.0
+port: 8000
+callback_url: http://host.docker.internal:8000
+attachments: file:///tmp/claudius-attachments
+log_conversation: false
+
+# upstream_llm:
+#   protocol: anthropic
+#   base_url: https://openrouter.ai/api
+#   api_key_env: OPENROUTER_API_KEY
+#   auth_mode: bearer
+
+# Anthropic example:
+# upstream_llm:
+#   protocol: anthropic
+#   base_url: https://api.anthropic.com
+#   api_key_env: ANTHROPIC_API_KEY
+#   auth_mode: x-api-key
+
+# OpenAI example:
+# upstream_llm:
+#   protocol: openai
+#   base_url: https://api.openai.com/v1
+#   api_key_env: OPENAI_API_KEY
+#   auth_mode: bearer
+
+# Cerebras example:
+upstream_llm:
+  protocol: openai
+  base_url: https://api.cerebras.ai/v1
+  api_key_env: CEREBRAS_API_KEY
+  auth_mode: bearer

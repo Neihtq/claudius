@@ -1,0 +1,22 @@
+# LiteLLM proxy — maps Claudius model names to OpenRouter backends.
+# Adjust the "model:" values to match the OpenRouter model IDs you want to use.
+# Full model list: https://openrouter.ai/models
+
+model_list:
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: openai/anthropic/claude-haiku-4.5
+      api_key: os.environ/OPENROUTER_API_KEY
+      api_base: https://openrouter.ai/api/v1
+
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openai/anthropic/claude-sonnet-4-5
+      api_key: os.environ/OPENROUTER_API_KEY
+      api_base: https://openrouter.ai/api/v1
+
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: openai/anthropic/claude-opus-4
+      api_key: os.environ/OPENROUTER_API_KEY
+      api_base: https://openrouter.ai/api/v1

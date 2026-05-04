@@ -1,0 +1,17 @@
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+    networks:
+      - claudius
+
+networks:
+  claudius:
+    name: claudius
+    driver: bridge

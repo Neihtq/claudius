@@ -1,0 +1,6 @@
+name: bad-workflow
+routing: {}
+claude:
+  system_prompt: "Missing channels"
+response:
+  channel: email

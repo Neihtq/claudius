@@ -1,0 +1,244 @@
+name: gitlab-assistant
+description: Clones a repository via runtime hooks and exposes restricted Git and GitLab tools to Claude
+
+routing:
+  channels: [email]
+  from:
+    - "*"
+  subject_patterns:
+    - "GitLab:*"
+
+claude:
+  model: qwen/qwen3.5-plus-20260420 # z-ai/glm-5-turbo # claude-sonnet-4-6
+  supports_images: false
+  system_prompt: |
+    You are a software engineering agent working inside /workspace.
+    The repository is prepared for you under /workspace/repo by runtime hooks.
+    You do NOT have a GitLab token or any other authentication credentials
+    available in your environment. You MUST use the available runtime MCP tools
+    for all GitLab operations (creating/updating merge requests, pushing,
+    waiting for pipelines, etc.). Do not attempt to use glab, gh, or any other
+    CLI tool that requires authentication — they will fail. Use your built-in
+    tools only for local Git operations such as inspecting diffs, creating
+    commits, and running checks. Make code changes in /workspace/repo, run
+    relevant checks, and before you finish always do all of the following:
+
+    1. Ensure a merge request exists for the runtime-managed branch.
+    2. Ensure the merge request title and description are up to date and
+       describe the current changeset holistically.
+    3. Never describe progression inside the merge request description.
+       The merge request description must describe only the absolute current
+       state of the branch and the resulting behavior.
+    4. Wait for the CI pipeline for the branch to finish successfully.
+    5. Retrieve the environment preview URL.
+    6. If the user later replies confirming they are happy with the result,
+       call merge_mr_and_close_session. Do not call it before explicit user
+       confirmation.
+
+    Your final response to the user must:
+    - include the environment preview URL
+    - answer the user's request in non-technical language
+    - avoid implementation detail unless the user explicitly asked for it
+    - after merge_mr_and_close_session succeeds, confirm the merge is done and
+      end the session
+
+runtime:
+  pre_launch:
+    - type: shell
+      when: session_start
+      run: |
+        : "${GITLAB_TOKEN:?GITLAB_TOKEN is required for GitLab runtime hooks}"
+        export GIT_TERMINAL_PROMPT=0
+        if [ ! -d "$REPO_DIR/.git" ]; then
+          AUTH_HEADER="$(printf 'oauth2:%s' "$GITLAB_TOKEN" | base64 | tr -d '\n')"
+          git -c credential.helper= \
+            -c "http.extraHeader=Authorization: Basic $AUTH_HEADER" \
+            clone "https://${REPO_HOST}/${PROJECT_PATH}.git" "$REPO_DIR"
+        fi
+        cd "$REPO_DIR"
+        git config user.name "Claudius"
+        git config user.email "claudius@example.com"
+    - type: shell
+      when: execution_start
+      run: |
+        : "${GITLAB_TOKEN:?GITLAB_TOKEN is required for GitLab runtime hooks}"
+        export GIT_TERMINAL_PROMPT=0
+        cd "$REPO_DIR"
+        AUTH_HEADER="$(printf 'oauth2:%s' "$GITLAB_TOKEN" | base64 | tr -d '\n')"
+        git -c credential.helper= \
+          -c "http.extraHeader=Authorization: Basic $AUTH_HEADER" \
+          fetch origin
+        if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+          git checkout "$BRANCH"
+        else
+          git checkout -B "$BRANCH"
+        fi
+
+  tool_context:
+    - name: GITLAB_TOKEN
+      env: GITLAB_TOKEN
+      # vault_read:
+      #   path: gitlab.com/config/default
+      #   field: token
+    - name: REPO_HOST
+      value: gitlab.com
+    - name: PROJECT_PATH
+      value: NiklasRosenstein/lavita-massagen.de
+    - name: REPO_DIR
+      value: /workspace/repo
+    - name: BRANCH
+      value: claudius/${{request.thread_id}}
+
+  tools:
+    - type: shell
+      name: git_push
+      description: Push the runtime-managed branch to origin only if the branch changes are limited to src/, README.md, package.json, and package-lock.json
+      run: |
+        : "${GITLAB_TOKEN:?GITLAB_TOKEN is required for GitLab runtime tools}"
+        export GIT_TERMINAL_PROMPT=0
+        cd "$REPO_DIR"
+        test "$(git branch --show-current)" = "$BRANCH"
+        AUTH_HEADER="$(printf 'oauth2:%s' "$GITLAB_TOKEN" | base64 | tr -d '\n')"
+        git -c credential.helper= \
+          -c "http.extraHeader=Authorization: Basic $AUTH_HEADER" \
+          fetch origin develop
+        changed_files="$(git diff --name-only origin/develop...HEAD)"
+        if [ -z "$changed_files" ]; then
+          echo "Refusing to push: no changes detected against origin/develop." >&2
+          exit 1
+        fi
+        invalid_files="$(printf '%s\n' "$changed_files" | grep -vE '^(src/|README\.md$|package\.json$|package-lock\.json$)' || true)"
+        if [ -n "$invalid_files" ]; then
+          echo "Refusing to push: only files under src/, README.md, package.json, and package-lock.json may be changed against origin/develop." >&2
+          echo "Disallowed files:" >&2
+          printf '%s\n' "$invalid_files" >&2
+          exit 1
+        fi
+        git -c credential.helper= \
+          -c "http.extraHeader=Authorization: Basic $AUTH_HEADER" \
+          push origin "$BRANCH:$BRANCH"
+
+    - type: shell
+      name: get_mr
+      description: Show the merge request for the runtime-managed branch if one exists
+      run: |
+        cd "$REPO_DIR"
+        export GLAB_TOKEN="$GITLAB_TOKEN"
+        glab mr view "$BRANCH"
+
+    - type: shell
+      name: create_mr
+      description: Create a merge request from the runtime-managed branch
+      run: |
+        cd "$REPO_DIR"
+        export GLAB_TOKEN="$GITLAB_TOKEN"
+        glab mr create \
+          --source-branch "$BRANCH" \
+          --target-branch develop \
+          --title "$INPUT_TITLE" \
+          --description "$INPUT_BODY"
+      params:
+        title:
+          type: string
+          description: Merge request title
+        body:
+          type: string
+          description: Merge request description
+
+    - type: shell
+      name: update_mr
+      description: Update the merge request title and description for the runtime-managed branch
+      run: |
+        cd "$REPO_DIR"
+        export GLAB_TOKEN="$GITLAB_TOKEN"
+        glab mr update "$BRANCH" \
+          --title "$INPUT_TITLE" \
+          --description "$INPUT_BODY"
+      params:
+        title:
+          type: string
+          description: Updated merge request title
+        body:
+          type: string
+          description: Updated merge request description
+
+    - type: shell
+      name: wait_for_pipeline
+      description: Wait for the latest pipeline on the runtime-managed branch to finish successfully
+      run: |
+        cd "$REPO_DIR"
+        export GLAB_TOKEN="$GITLAB_TOKEN"
+        while true; do
+          status=$(glab ci status --branch "$BRANCH" 2>&1 || true)
+          echo "$status"
+          if echo "$status" | grep -qiE 'passed|success'; then
+            exit 0
+          elif echo "$status" | grep -qiE 'failed|canceled|error'; then
+            echo "Pipeline did not succeed." >&2
+            exit 1
+          fi
+          sleep 15
+        done
+
+    - type: shell
+      name: get_preview_url
+      description: Retrieve the current environment preview URL for the runtime-managed branch
+      run: |
+        cd "$REPO_DIR"
+        export GLAB_TOKEN="$GITLAB_TOKEN"
+        python - <<'PY'
+        import json
+        import os
+        import subprocess
+        import sys
+        from urllib.parse import quote
+
+        project = quote(os.environ["PROJECT_PATH"], safe="")
+        branch = os.environ["BRANCH"]
+
+        mr_result = subprocess.run(
+            ["glab", "api", f"/projects/{project}/merge_requests?source_branch={branch}&state=opened"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ,
+        )
+        mrs = json.loads(mr_result.stdout)
+        if not mrs:
+            print("No open merge request found for branch", branch, file=sys.stderr)
+            sys.exit(1)
+        mr_iid = mrs[0]["iid"]
+
+        env_result = subprocess.run(
+            ["glab", "api", f"/projects/{project}/environments?search=preview/mr-{mr_iid}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ,
+        )
+        environments = json.loads(env_result.stdout)
+        matches = [env for env in environments if env.get("external_url")]
+        if not matches:
+            print("No preview environment URL found for MR", mr_iid, file=sys.stderr)
+            sys.exit(1)
+        print(matches[0]["external_url"])
+        PY
+
+    - type: shell
+      name: merge_mr_and_close_session
+      description: Squash merge the merge request for the runtime-managed branch, delete the source branch, and close the current Claudius session
+      run: |
+        cd "$REPO_DIR"
+        export GLAB_TOKEN="$GITLAB_TOKEN"
+        glab mr merge "$BRANCH" --squash --remove-source-branch
+        curl --fail --silent --show-error \
+          -X POST \
+          -H "Authorization: Bearer $CLAUDIUS_SESSION_TOKEN" \
+          "${CLAUDIUS_CALLBACK_URL%/}/sessions/${CLAUDIUS_SESSION_ID}/close"
+
+response:
+  channel: email
+
+session:
+  timeout_minutes: 30
+  max_messages: 20

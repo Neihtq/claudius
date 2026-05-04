@@ -1,0 +1,1 @@
+{"root":["./src/api.ts","./src/main.tsx","./src/types.ts","./src/components/App.tsx","./src/components/Conversation.tsx","./src/components/ConversationEventPanel.tsx","./src/components/LogPanel.tsx","./src/components/MarkdownMessage.tsx","./src/components/NewSessionModal.tsx","./src/components/ProxyLogPanel.tsx","./src/components/SessionsList.tsx"],"version":"5.6.3"}
