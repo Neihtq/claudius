@@ -15,10 +15,10 @@ RUN pip install uv
 RUN npm install -g @anthropic-ai/claude-code @playwright/mcp playwright
 RUN playwright install --with-deps chromium
 
-COPY pyproject.toml .
+COPY pyproject.toml uv.lock .
 COPY src/ src/
 
-RUN uv sync --no-dev
+RUN UV_LINK_MODE=copy uv sync --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"
 
