@@ -40,6 +40,14 @@ Then open **http://localhost:8000/ui/** in your browser.
 
 The `--callback-url` flag enables the local dev channel: session workers will POST their replies back to the controller instead of sending real emails, and replies appear in the browser via Server-Sent Events.
 
+If you want to test real inbound email delivery from Resend in local dev, expose the controller with a public HTTPS tunnel and point Resend's `email.received` webhook at it. A simple no-account option is:
+
+```bash
+cloudflared tunnel --url http://localhost:8000
+```
+
+Then configure the Resend webhook to call `https://<your-subdomain>.trycloudflare.com/webhook/resend`.
+
 ## Using the UI
 
 1. Click **+ New Session** and fill in the channel, workflow, and message.

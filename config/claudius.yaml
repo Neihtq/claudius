@@ -9,6 +9,11 @@ callback_url: http://host.docker.internal:8000
 attachments: file:///tmp/claudius-attachments
 log_conversation: false
 
+# Resend inbound email is webhook-based. In local dev, expose this controller on a
+# public HTTPS URL with a tunnel (for example `cloudflared tunnel --url
+# http://localhost:8000`) and point Resend's email.received webhook at that URL
+# plus /webhook/resend.
+
 # upstream_llm:
 #   protocol: anthropic
 #   base_url: https://openrouter.ai/api

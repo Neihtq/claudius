@@ -199,6 +199,7 @@ def create_controller_app(
     session_manager: SessionManager,
     channels: dict[str, AbstractChannel],
     broker: SSEBroker,
+    inbound_webhooks: dict[str, str] | None = None,
     proxy_secret: str = "",
     proxy_upstream: ProxyUpstream | None = None,
     attachment_store: AttachmentStore | None = None,
@@ -209,6 +210,7 @@ def create_controller_app(
         broker.close()
 
     app = FastAPI(lifespan=lifespan)
+    inbound_webhooks = inbound_webhooks or {}
 
     @app.get("/health")
     async def health():
@@ -218,15 +220,29 @@ def create_controller_app(
     async def list_workflows():
         return session_manager.list_workflow_names()
 
-    @app.post("/webhook/resend")
-    async def webhook_resend(request: Request):
-        channel = channels.get("email")
+    async def _handle_inbound_webhook(request: Request, channel_name: str):
+        channel = channels.get(channel_name)
+        if channel is None:
+            raise HTTPException(status_code=404, detail=f"Channel not configured: {channel_name}")
         message = await channel.parse_webhook(request)
         try:
             await session_manager.handle_message(message)
         except NoWorkflowMatch as e:
             return {"status": "no_match", "detail": str(e)}
         return {"status": "accepted"}
+
+    def _make_webhook_handler(channel_name: str):
+        async def _webhook_handler(request: Request):
+            return await _handle_inbound_webhook(request, channel_name)
+
+        return _webhook_handler
+
+    for webhook_path, channel_name in inbound_webhooks.items():
+        app.add_api_route(
+            webhook_path,
+            _make_webhook_handler(channel_name),
+            methods=["POST"],
+        )
 
     @app.get("/sessions")
     async def list_sessions():

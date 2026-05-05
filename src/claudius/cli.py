@@ -156,9 +156,17 @@ def serve(
         },
     )
 
-    resend_api_key = os.environ.get("RESEND_API_KEY", "")
-    resend_from = os.environ.get("RESEND_FROM_ADDRESS", "claudius@example.com")
+    email_channel_config = serve_config.channels.email
+    resend_provider = serve_config.providers.resend
+    if email_channel_config.provider != "resend":
+        raise click.ClickException(
+            f"Unsupported channels.email.provider: {email_channel_config.provider!r}"
+        )
+    resend_api_key = os.environ.get(resend_provider.api_key_env, "")
+    resend_from = resend_provider.from_address
     channel = ResendChannel(api_key=resend_api_key, from_address=resend_from)
+    channels = {"email": channel}
+    inbound_webhooks = {resend_provider.webhook_path: "email"}
 
     backend = DockerBackend(
         image=image,
@@ -191,7 +199,10 @@ def serve(
         logger.info(f"  proxy target  {proxy_upstream.base_url}")
         logger.info(f"  proxy key env {proxy_upstream_api_key_env or '(none)'}")
         logger.info(f"  attachments   {attachment_store.describe() if attachment_store else '(none)'}")
+        logger.info(f"  email channel {email_channel_config.provider}")
+        logger.info(f"  resend key    {resend_provider.api_key_env}")
         logger.info(f"  email from    {resend_from}")
+        logger.info(f"  webhook path  {resend_provider.webhook_path}")
         logger.info(f"  workflows     {', '.join(w.name for w in workflows) or '(none)'}")
 
         manager = SessionManager(
@@ -199,18 +210,21 @@ def serve(
             backend=backend,
             workflows=workflows,
             workspaces_path=workspaces_path,
-            channels={"email": channel},
+            channels=channels,
             broker=broker,
             callback_url=callback_url,
             proxy_secret=proxy_secret,
             attachment_store=attachment_store,
             log_conversation=log_conversation,
+            resend_api_key=resend_api_key,
+            resend_from_address=resend_from,
         )
         await manager.recover()
         app = create_controller_app(
             session_manager=manager,
-            channels={"email": channel},
+            channels=channels,
             broker=broker,
+            inbound_webhooks=inbound_webhooks,
             proxy_secret=proxy_secret,
             proxy_upstream=proxy_upstream,
             attachment_store=attachment_store,
@@ -279,7 +293,7 @@ def session(session_id, workspaces_path, host, port, idle_timeout):
     else:
         from claudius.channels.resend import ResendChannel
         resend_api_key = os.environ["RESEND_API_KEY"]
-        resend_from = os.environ.get("RESEND_FROM_ADDRESS", "claudius@example.com")
+        resend_from = os.environ["RESEND_FROM_ADDRESS"]
         channel = ResendChannel(api_key=resend_api_key, from_address=resend_from)
 
     workspace_path = os.environ.get("CLAUDIUS_WORKSPACE_PATH", "/workspace")

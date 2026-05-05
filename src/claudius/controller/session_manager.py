@@ -96,6 +96,8 @@ class SessionManager:
         attachment_store: AttachmentStore | None = None,
         log_conversation: bool = False,
         secret_provider: SecretProvider | None = None,
+        resend_api_key: str = "",
+        resend_from_address: str = "claudius@example.com",
     ):
         self._db = db
         self._backend = backend
@@ -108,6 +110,8 @@ class SessionManager:
         self._attachment_store = attachment_store
         self._log_conversation = log_conversation
         self._secret_provider = secret_provider or EnvironmentSecretProvider()
+        self._resend_api_key = resend_api_key
+        self._resend_from_address = resend_from_address
         self._tail_tasks: dict[str, asyncio.Task] = {}
         self._idle_stop_tasks: dict[str, asyncio.Task] = {}
         self._interrupt_after_turn: dict[str, str] = {}
@@ -1098,8 +1102,8 @@ class SessionManager:
             }),
             "CLAUDIUS_CONVERSATION_TEXT": conversation_text,
             "CLAUDIUS_WORKSPACE_PATH": "/workspace",
-            "RESEND_API_KEY": os.environ.get("RESEND_API_KEY", ""),
-            "RESEND_FROM_ADDRESS": os.environ.get("RESEND_FROM_ADDRESS", "claudius@example.com"),
+            "RESEND_API_KEY": self._resend_api_key,
+            "RESEND_FROM_ADDRESS": self._resend_from_address,
             "CLAUDIUS_SESSION_ID": session_id,
         }
         if output_message_id:

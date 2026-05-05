@@ -1146,6 +1146,30 @@ async def test_worker_env_includes_session_token_when_proxy_enabled(db, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_worker_env_uses_configured_resend_values(db, tmp_path, monkeypatch):
+    backend = _BackendStub()
+    monkeypatch.setenv("RESEND_API_KEY", "host-env-key")
+    monkeypatch.setenv("RESEND_FROM_ADDRESS", "host@example.com")
+
+    manager = SessionManager(
+        db=db,
+        backend=backend,
+        workflows=[_workflow()],
+        workspaces_path=str(tmp_path / "workspaces"),
+        channels={},
+        resend_api_key="config-key",
+        resend_from_address="configured@example.com",
+    )
+    manager._start_log_tailer = lambda *args, **kwargs: None
+
+    await manager.handle_message(_message(thread_id="configured-resend-thread"))
+
+    extra_env = backend.create_execution_calls[0][3]
+    assert extra_env["RESEND_API_KEY"] == "config-key"
+    assert extra_env["RESEND_FROM_ADDRESS"] == "configured@example.com"
+
+
+@pytest.mark.asyncio
 async def test_receive_outbound_stores_message_and_publishes(db, tmp_path):
     backend = _BackendStub()
     broker = SSEBroker()

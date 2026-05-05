@@ -249,6 +249,46 @@ class UpstreamLLMConfig(BaseModel):
         return self
 
 
+class ResendProviderConfig(BaseModel):
+    api_key_env: str = "RESEND_API_KEY"
+    from_address: str = "claudius@example.com"
+    webhook_path: str = "/webhook/resend"
+
+    @model_validator(mode="after")
+    def validate_resend(self) -> "ResendProviderConfig":
+        self.api_key_env = self.api_key_env.strip()
+        self.from_address = self.from_address.strip()
+        self.webhook_path = self.webhook_path.strip()
+        if not self.api_key_env:
+            raise ValueError("providers.resend.api_key_env must not be empty")
+        if not self.from_address:
+            raise ValueError("providers.resend.from_address must not be empty")
+        if not self.webhook_path:
+            raise ValueError("providers.resend.webhook_path must not be empty")
+        if not self.webhook_path.startswith("/"):
+            raise ValueError("providers.resend.webhook_path must start with '/'")
+        return self
+
+
+class ProvidersConfig(BaseModel):
+    resend: ResendProviderConfig = Field(default_factory=ResendProviderConfig)
+
+
+class EmailChannelConfig(BaseModel):
+    provider: str = "resend"
+
+    @model_validator(mode="after")
+    def validate_provider(self) -> "EmailChannelConfig":
+        self.provider = self.provider.strip().lower()
+        if self.provider != "resend":
+            raise ValueError("channels.email.provider currently only supports 'resend'")
+        return self
+
+
+class ChannelsConfig(BaseModel):
+    email: EmailChannelConfig = Field(default_factory=EmailChannelConfig)
+
+
 class StartupConfig(BaseModel):
     config_dir: str = "config/workflows"
     db_path: str = "claudius.db"
@@ -261,6 +301,8 @@ class StartupConfig(BaseModel):
     attachments: str = "file:///tmp/claudius-attachments"
     log_conversation: bool = False
     upstream_llm: UpstreamLLMConfig = Field(default_factory=UpstreamLLMConfig)
+    providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+    channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
 
     @model_validator(mode="after")
     def validate_startup(self) -> "StartupConfig":
