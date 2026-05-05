@@ -72,7 +72,10 @@ class OpenAIAdapter(MessageFormatAdapter):
         headers: dict[str, str],
         body: bytes,
     ) -> tuple[str, dict[str, str], bytes]:
-        adapted_path = "chat/completions" if path.strip("/") == "v1/messages" else path
+        normalized = path.strip("/")
+        if normalized.startswith("v1/"):
+            normalized = normalized[3:]
+        adapted_path = "chat/completions" if normalized == "messages" else normalized
 
         adapted_headers = {
             k: v for k, v in headers.items()
@@ -82,7 +85,7 @@ class OpenAIAdapter(MessageFormatAdapter):
         if (
             body
             and "application/json" in headers.get("content-type", "").lower()
-            and path.strip("/") == "v1/messages"
+            and normalized == "messages"
         ):
             try:
                 payload = json.loads(body)
