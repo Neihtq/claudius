@@ -16,7 +16,7 @@ from claudius.controller.session_manager import (
     SessionManager,
 )
 from claudius.controller.sse import SSEBroker
-from claudius.models import Attachment, Execution, InboundMessage, Session, SessionState
+from claudius.models import Attachment, Execution, ExecutionPhase, InboundMessage, Session, SessionState
 from claudius.runtime import SecretProvider
 
 
@@ -226,6 +226,56 @@ async def test_handle_new_message_builds_runtime_tool_mounts(db, tmp_path):
     assert tool_mounts[0].pre_launch_commands == []
     assert tool_mounts[0].sidecars
     assert extra_env["CLAUDIUS_MCP_CONFIG"] == "/workspace/.claudius-runtime/mcp.json"
+
+
+@pytest.mark.asyncio
+async def test_recover_marks_starting_execution_failed(db, tmp_path):
+    backend = _BackendStub()
+    manager = SessionManager(
+        db=db,
+        backend=backend,
+        workflows=[_workflow()],
+        workspaces_path=str(tmp_path / "workspaces"),
+        channels={},
+    )
+
+    session = Session(
+        session_id="sess-starting",
+        thread_id="thread-starting",
+        channel="email",
+        workflow_name="test-wf",
+        state=SessionState.ACTIVE,
+        workspace_path=str(tmp_path / "workspaces" / "sess-starting"),
+        created_at=datetime.now(timezone.utc),
+        last_message_at=datetime.now(timezone.utc),
+    )
+    await db.create_session(session)
+    execution = Execution(
+        execution_id="exec-starting",
+        session_id=session.session_id,
+        worker_address=None,
+        started_at=datetime.now(timezone.utc),
+        halted_at=None,
+        halt_reason=None,
+        phase=ExecutionPhase.STARTING,
+    )
+    await db.create_execution(execution)
+
+    started_tailers: list[str] = []
+    manager._start_log_tailer = lambda execution, since=None: started_tailers.append(execution.execution_id)
+
+    await manager.recover()
+
+    recovered = await db.get_execution("exec-starting")
+    assert recovered is not None
+    assert recovered.halt_reason == "startup_failed"
+    assert recovered.phase == ExecutionPhase.FAILED
+    recovered_session = await db.get_session(session.session_id)
+    assert recovered_session is not None
+    assert recovered_session.state == SessionState.ERROR
+    assert recovered_session.last_execution_result == "failed"
+    assert backend.deleted_executions[0].execution_id == "exec-starting"
+    assert started_tailers == []
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,8 @@ from claudius.models import (
     ToolMount,
 )
 
+_DOCKER_API_TIMEOUT_SECONDS = 30.0
+
 
 class DockerBackend(AbstractBackend):
     def __init__(
@@ -71,7 +73,7 @@ class DockerBackend(AbstractBackend):
 
         container_name = f"claudius-session-{session.session_id[:8]}"
         try:
-            container = self._run_container_with_conflict_retry(
+            container = await self._run_container_with_conflict_retry_async(
                 self._image,
                 session.session_id,
                 "worker",
@@ -90,9 +92,9 @@ class DockerBackend(AbstractBackend):
                 extra_hosts={"host.docker.internal": "host-gateway"},
             )
         except Exception:
-            self._stop_sidecars(started_sidecars)
+            await self._stop_sidecars_async(started_sidecars)
             raise
-        container.reload()
+        await self._reload_container_async(container, role="worker")
         worker_host, worker_port = _container_target(container, self._network, "8080/tcp", self._probe_mode)
         runtime_container = None
         if started_sidecars:
@@ -174,7 +176,7 @@ class DockerBackend(AbstractBackend):
                 }
                 if self._probe_mode == "host_port":
                     run_kwargs["ports"] = {"8090/tcp": None}
-                container = self._run_container_with_conflict_retry(
+                container = await self._run_container_with_conflict_retry_async(
                     sidecar.get("image", self._image),
                     session.session_id,
                     "runtime-sidecar",
@@ -184,7 +186,7 @@ class DockerBackend(AbstractBackend):
                 try:
                     await self._wait_for_sidecar_ready(container)
                 except Exception:
-                    self._stop_sidecars(containers)
+                    await self._stop_sidecars_async(containers)
                     raise
         return containers
 
@@ -192,7 +194,7 @@ class DockerBackend(AbstractBackend):
         deadline = time.monotonic() + timeout_seconds
         async with httpx.AsyncClient(timeout=1.0) as client:
             while time.monotonic() < deadline:
-                container.reload()
+                await self._reload_container_async(container, role="runtime-sidecar")
                 state = container.attrs.get("State", {}).get("Status")
                 if state in {"exited", "dead"}:
                     logs = _container_log_lines(container)
@@ -240,16 +242,59 @@ class DockerBackend(AbstractBackend):
             log_lines=logs,
         )
 
-    def _stop_sidecars(self, containers: list[Any]) -> None:
+    async def _stop_sidecars_async(self, containers: list[Any]) -> None:
         for container in containers:
             try:
-                container.stop(timeout=10)
+                await asyncio.wait_for(
+                    asyncio.to_thread(container.stop, timeout=10),
+                    timeout=_DOCKER_API_TIMEOUT_SECONDS,
+                )
             except Exception:
                 pass
             try:
-                container.remove()
+                await asyncio.wait_for(
+                    asyncio.to_thread(container.remove),
+                    timeout=_DOCKER_API_TIMEOUT_SECONDS,
+                )
             except Exception:
                 pass
+
+    async def _run_container_with_conflict_retry_async(
+        self,
+        image: str,
+        session_id: str,
+        role: str,
+        **kwargs: Any,
+    ) -> Any:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._run_container_with_conflict_retry,
+                    image,
+                    session_id,
+                    role,
+                    **kwargs,
+                ),
+                timeout=_DOCKER_API_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            name = kwargs.get("name", role)
+            raise ExecutionStartupError(
+                f"{role} container launch timed out after {_DOCKER_API_TIMEOUT_SECONDS:.0f}s"
+                f" (name={name})",
+            ) from exc
+
+    async def _reload_container_async(self, container: Any, *, role: str) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(container.reload),
+                timeout=_DOCKER_API_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise ExecutionStartupError(
+                f"{role} container inspection timed out after {_DOCKER_API_TIMEOUT_SECONDS:.0f}s"
+                f" (name={container.name})",
+            ) from exc
 
     def _run_container_with_conflict_retry(
         self,

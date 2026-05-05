@@ -128,6 +128,24 @@ class SessionManager:
     async def recover(self) -> None:
         active = await self._db.list_active_executions()
         for execution in active:
+            if execution.phase == ExecutionPhase.STARTING:
+                logger.warning(
+                    "failing unrecoverable startup execution execution_id={} session_id={}",
+                    execution.execution_id,
+                    execution.session_id,
+                )
+                try:
+                    await self._backend.delete_execution(execution)
+                except Exception as exc:
+                    logger.warning(
+                        "failed to delete unrecoverable startup execution execution_id={} error={}",
+                        execution.execution_id,
+                        exc,
+                    )
+                await self._db.halt_execution(execution.execution_id, "startup_failed")
+                await self._db.update_session_last_execution_result(execution.session_id, "failed")
+                await self._db.update_session_state(execution.session_id, SessionState.ERROR)
+                continue
             since = await self._db.get_last_log_timestamp(execution.execution_id)
             logger.info(
                 f"recovering execution execution_id={execution.execution_id} since={since}"
@@ -876,7 +894,6 @@ class SessionManager:
             self._prime_execution_containers(execution, session_id, tool_mounts)
             await self._db.create_execution(execution)
             await self._publish_execution_event(execution)
-            self._start_log_tailer(execution)
             logger.info(f"launching execution session_id={session_id} workflow={workflow.name}")
             execution = await self._backend.create_execution(
                 session,
@@ -896,6 +913,7 @@ class SessionManager:
                 runtime_container=execution.runtime_container,
                 worker_container=execution.worker_container,
             )
+            self._start_log_tailer(execution)
             await self._record_local_input_event(
                 session_id,
                 execution.execution_id,
@@ -994,7 +1012,6 @@ class SessionManager:
             self._prime_execution_containers(execution, session.session_id, tool_mounts)
             await self._db.create_execution(execution)
             await self._publish_execution_event(execution)
-            self._start_log_tailer(execution)
             logger.info(f"resuming session session_id={session.session_id}")
             execution = await self._backend.create_execution(
                 session,
@@ -1014,6 +1031,7 @@ class SessionManager:
                 runtime_container=execution.runtime_container,
                 worker_container=execution.worker_container,
             )
+            self._start_log_tailer(execution)
             for pending_message in pending:
                 await self._record_local_input_event(
                     session.session_id,

@@ -1,9 +1,11 @@
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone
 from pathlib import Path
 import docker
 import httpx
+from claudius.controller.backends.base import ExecutionStartupError
 from claudius.models import Session, SessionState, ToolMount, Execution
 
 def _session():
@@ -255,6 +257,47 @@ async def test_create_execution_retries_after_stale_worker_name_conflict():
     stale_worker.remove.assert_called_once_with(force=True)
     assert mock_client.containers.run.call_count == 2
 
+
+@pytest.mark.asyncio
+async def test_create_execution_stops_sidecars_when_worker_launch_times_out():
+    mock_client = MagicMock()
+    mock_sidecar_container = MagicMock()
+    mock_client.containers.run.return_value = mock_sidecar_container
+
+    with patch("claudius.controller.backends.docker.docker") as mock_docker:
+        mock_docker.from_env.return_value = mock_client
+        from claudius.controller.backends.docker import DockerBackend
+        backend = DockerBackend(
+            image="claudius:latest",
+            workspaces_path="/workspaces",
+            network="claudius",
+        )
+
+    backend._wait_for_sidecar_ready = AsyncMock()
+    backend._run_container_with_conflict_retry_async = AsyncMock(
+        side_effect=[
+            mock_sidecar_container,
+            ExecutionStartupError("worker container launch timed out after 30s"),
+        ]
+    )
+
+    tool_mounts = [
+        ToolMount(
+            sidecars=[{
+                "name": "claudius-runtime-sess-abc",
+                "hostname": "claudius-runtime-sess-abc",
+                "command": ["runtime-sidecar", "--phase", "execution_start"],
+                "environment": {"CLAUDIUS_RUNTIME_SPEC_JSON": "{}"},
+            }],
+        )
+    ]
+
+    with pytest.raises(ExecutionStartupError, match="worker container launch timed out"):
+        await backend.create_execution(_session(), _workflow(), tool_mounts)
+
+    mock_sidecar_container.stop.assert_called_once_with(timeout=10)
+    mock_sidecar_container.remove.assert_called_once()
+
 @pytest.mark.asyncio
 async def test_delete_execution_stops_container():
     mock_client = MagicMock()
@@ -289,7 +332,11 @@ async def test_wait_for_sidecar_ready_raises_sidecar_http_failure():
     with patch("claudius.controller.backends.docker.docker") as mock_docker:
         mock_docker.from_env.return_value = mock_client
         from claudius.controller.backends.docker import DockerBackend
-        backend = DockerBackend(image="claudius:latest", workspaces_path="/workspaces")
+        backend = DockerBackend(
+            image="claudius:latest",
+            workspaces_path="/workspaces",
+            probe_mode="container_ip",
+        )
 
     container = MagicMock()
     container.attrs = {
@@ -312,3 +359,27 @@ async def test_wait_for_sidecar_ready_raises_sidecar_http_failure():
     with patch("claudius.controller.backends.docker.httpx.AsyncClient", return_value=_Client()):
         with pytest.raises(RuntimeError, match="hook execution_start failed"):
             await backend._wait_for_sidecar_ready(container, timeout_seconds=0.5)
+
+
+@pytest.mark.asyncio
+async def test_run_container_with_conflict_retry_async_times_out():
+    mock_client = MagicMock()
+
+    with patch("claudius.controller.backends.docker.docker") as mock_docker:
+        mock_docker.from_env.return_value = mock_client
+        from claudius.controller.backends.docker import DockerBackend
+        backend = DockerBackend(image="claudius:latest", workspaces_path="/workspaces")
+
+    async def slow_to_thread(func, *args, **kwargs):
+        await asyncio.sleep(0.02)
+        return None
+
+    with patch("claudius.controller.backends.docker._DOCKER_API_TIMEOUT_SECONDS", 0.01):
+        with patch("claudius.controller.backends.docker.asyncio.to_thread", side_effect=slow_to_thread):
+            with pytest.raises(ExecutionStartupError, match="worker container launch timed out"):
+                await backend._run_container_with_conflict_retry_async(
+                    "claudius:latest",
+                    "sess-abc",
+                    "worker",
+                    name="claudius-session-sess-abc",
+                )

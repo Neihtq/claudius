@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 
+_RUNTIME_TOOL_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
 
 _BUILTIN_REPORT_FATAL_ERROR = {
     "name": "report_fatal_error",
@@ -133,7 +134,7 @@ def _handle_message(
                 f"{endpoint_url}/invoke/{tool_name}",
                 json={"params": arguments},
                 headers={"Authorization": f"Bearer {auth_token}"},
-                timeout=60.0,
+                timeout=_RUNTIME_TOOL_HTTP_TIMEOUT,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

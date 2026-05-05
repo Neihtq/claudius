@@ -4,7 +4,11 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from claudius.runtime_mcp_bridge import _handle_message, _BUILTIN_REPORT_FATAL_ERROR
+from claudius.runtime_mcp_bridge import (
+    _handle_message,
+    _BUILTIN_REPORT_FATAL_ERROR,
+    _RUNTIME_TOOL_HTTP_TIMEOUT,
+)
 
 
 _TOOLS = {
@@ -115,3 +119,25 @@ def test_unknown_tool_returns_error():
     })
     assert "error" in resp
     assert resp["error"]["code"] == -32602
+
+
+def test_runtime_tool_call_uses_non_expiring_read_timeout():
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {"exit_code": 0, "stdout": "ok", "stderr": ""}
+
+    with patch("claudius.runtime_mcp_bridge.httpx.post", return_value=mock_resp) as mock_post:
+        resp = _call({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "git_status", "arguments": {}},
+        })
+
+    mock_post.assert_called_once_with(
+        f"{_ENDPOINT}/invoke/git_status",
+        json={"params": {}},
+        headers={"Authorization": f"Bearer {_AUTH}"},
+        timeout=_RUNTIME_TOOL_HTTP_TIMEOUT,
+    )
+    assert resp["result"]["isError"] is False

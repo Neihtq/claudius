@@ -9,7 +9,7 @@ routing:
     - "GitLab:*"
 
 claude:
-  model: qwen/qwen3.5-plus-20260420 # z-ai/glm-5-turbo # claude-sonnet-4-6
+  model: qwen-3-235b-a22b-instruct-2507 # z-ai/glm-5-turbo # claude-sonnet-4-6
   supports_images: false
   system_prompt: |
     You are a software engineering agent working inside /workspace.
@@ -179,6 +179,192 @@ runtime:
           fi
           sleep 15
         done
+
+    - type: shell
+      name: get_latest_commit_jobs
+      description: Show jobs from the latest pipeline for the current HEAD commit of the runtime-managed branch only
+      run: |
+        cd "$REPO_DIR"
+        export GLAB_TOKEN="$GITLAB_TOKEN"
+        python - <<'PY'
+        import json
+        import os
+        import subprocess
+        import sys
+        from urllib.parse import quote
+
+        project = quote(os.environ["PROJECT_PATH"], safe="")
+        branch = os.environ["BRANCH"]
+
+        branch_result = subprocess.run(
+            ["glab", "api", f"/projects/{project}/repository/branches/{quote(branch, safe='')}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ,
+        )
+        branch_info = json.loads(branch_result.stdout)
+        head_sha = branch_info["commit"]["id"]
+
+        pipeline_result = subprocess.run(
+            [
+                "glab",
+                "api",
+                f"/projects/{project}/pipelines?ref={quote(branch, safe='')}&sha={head_sha}&per_page=1&order_by=updated_at&sort=desc",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ,
+        )
+        pipelines = json.loads(pipeline_result.stdout)
+        if not pipelines:
+            print(f"No pipeline found for branch {branch} at HEAD {head_sha}.", file=sys.stderr)
+            sys.exit(1)
+        pipeline = pipelines[0]
+        pipeline_id = pipeline["id"]
+
+        jobs_result = subprocess.run(
+            ["glab", "api", f"/projects/{project}/pipelines/{pipeline_id}/jobs?per_page=100"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ,
+        )
+        jobs = json.loads(jobs_result.stdout)
+
+        scoped_jobs = [
+            {
+                "id": job["id"],
+                "name": job["name"],
+                "stage": job["stage"],
+                "status": job["status"],
+                "allow_failure": job.get("allow_failure", False),
+                "web_url": job.get("web_url"),
+            }
+            for job in jobs
+            if job.get("pipeline", {}).get("id") == pipeline_id and job.get("commit", {}).get("id") == head_sha
+        ]
+        if not scoped_jobs:
+            print(
+                f"No jobs found for latest pipeline {pipeline_id} on branch {branch} at HEAD {head_sha}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        print(
+            json.dumps(
+                {
+                    "branch": branch,
+                    "head_sha": head_sha,
+                    "pipeline": {
+                        "id": pipeline_id,
+                        "status": pipeline.get("status"),
+                        "web_url": pipeline.get("web_url"),
+                    },
+                    "jobs": scoped_jobs,
+                },
+                indent=2,
+            )
+        )
+        PY
+
+    - type: shell
+      name: get_latest_commit_job_logs
+      description: Show logs for jobs from the latest pipeline for the current HEAD commit of the runtime-managed branch only
+      run: |
+        cd "$REPO_DIR"
+        export GLAB_TOKEN="$GITLAB_TOKEN"
+        python - <<'PY'
+        import json
+        import os
+        import subprocess
+        import sys
+        from urllib.parse import quote
+
+        project = quote(os.environ["PROJECT_PATH"], safe="")
+        branch = os.environ["BRANCH"]
+
+        branch_result = subprocess.run(
+            ["glab", "api", f"/projects/{project}/repository/branches/{quote(branch, safe='')}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ,
+        )
+        branch_info = json.loads(branch_result.stdout)
+        head_sha = branch_info["commit"]["id"]
+
+        pipeline_result = subprocess.run(
+            [
+                "glab",
+                "api",
+                f"/projects/{project}/pipelines?ref={quote(branch, safe='')}&sha={head_sha}&per_page=1&order_by=updated_at&sort=desc",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ,
+        )
+        pipelines = json.loads(pipeline_result.stdout)
+        if not pipelines:
+            print(f"No pipeline found for branch {branch} at HEAD {head_sha}.", file=sys.stderr)
+            sys.exit(1)
+        pipeline = pipelines[0]
+        pipeline_id = pipeline["id"]
+
+        jobs_result = subprocess.run(
+            ["glab", "api", f"/projects/{project}/pipelines/{pipeline_id}/jobs?per_page=100"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ,
+        )
+        jobs = json.loads(jobs_result.stdout)
+
+        scoped_jobs = [
+            job
+            for job in jobs
+            if job.get("pipeline", {}).get("id") == pipeline_id and job.get("commit", {}).get("id") == head_sha
+        ]
+        if not scoped_jobs:
+            print(
+                f"No jobs found for latest pipeline {pipeline_id} on branch {branch} at HEAD {head_sha}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        output = {
+            "branch": branch,
+            "head_sha": head_sha,
+            "pipeline": {
+                "id": pipeline_id,
+                "status": pipeline.get("status"),
+                "web_url": pipeline.get("web_url"),
+            },
+            "jobs": [],
+        }
+        for job in scoped_jobs:
+            trace_result = subprocess.run(
+                ["glab", "api", f"/projects/{project}/jobs/{job['id']}/trace"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=os.environ,
+            )
+            output["jobs"].append(
+                {
+                    "id": job["id"],
+                    "name": job["name"],
+                    "stage": job["stage"],
+                    "status": job["status"],
+                    "web_url": job.get("web_url"),
+                    "trace": trace_result.stdout,
+                }
+            )
+
+        print(json.dumps(output, indent=2))
+        PY
 
     - type: shell
       name: get_preview_url
