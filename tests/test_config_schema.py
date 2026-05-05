@@ -125,3 +125,35 @@ def test_startup_config_rejects_invalid_protocol():
         StartupConfig.model_validate({
             "upstream_llm": {"protocol": "bogus"},
         })
+
+
+def test_startup_config_accepts_model_pricing():
+    cfg = StartupConfig.model_validate({
+        "upstream_llm": {
+            "protocol": "openai",
+            "model_pricing": {
+                "qwen-3-235b-a22b-instruct-2507": {
+                    "input_cost_per_million_tokens_usd": 0.6,
+                    "output_cost_per_million_tokens_usd": 1.2,
+                }
+            },
+        }
+    })
+    pricing = cfg.upstream_llm.model_pricing["qwen-3-235b-a22b-instruct-2507"]
+    assert pricing.input_cost_per_million_tokens_usd == 0.6
+    assert pricing.output_cost_per_million_tokens_usd == 1.2
+
+
+def test_startup_config_rejects_negative_model_pricing():
+    with pytest.raises(Exception):
+        StartupConfig.model_validate({
+            "upstream_llm": {
+                "protocol": "openai",
+                "model_pricing": {
+                    "qwen": {
+                        "input_cost_per_million_tokens_usd": -1,
+                        "output_cost_per_million_tokens_usd": 1,
+                    }
+                },
+            }
+        })

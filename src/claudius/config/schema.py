@@ -197,11 +197,29 @@ class WorkflowConfig(BaseModel):
     session: SessionConfig = Field(default_factory=SessionConfig)
 
 
+class UpstreamModelPricingConfig(BaseModel):
+    input_cost_per_million_tokens_usd: float
+    output_cost_per_million_tokens_usd: float
+
+    @model_validator(mode="after")
+    def validate_pricing(self) -> "UpstreamModelPricingConfig":
+        if self.input_cost_per_million_tokens_usd < 0:
+            raise ValueError(
+                "upstream_llm.model_pricing input_cost_per_million_tokens_usd must be >= 0"
+            )
+        if self.output_cost_per_million_tokens_usd < 0:
+            raise ValueError(
+                "upstream_llm.model_pricing output_cost_per_million_tokens_usd must be >= 0"
+            )
+        return self
+
+
 class UpstreamLLMConfig(BaseModel):
     protocol: str = "anthropic"
     base_url: str = ""
     api_key_env: str = ""
     auth_mode: str | None = None
+    model_pricing: dict[str, UpstreamModelPricingConfig] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_upstream(self) -> "UpstreamLLMConfig":
@@ -221,6 +239,13 @@ class UpstreamLLMConfig(BaseModel):
                 "upstream_llm.auth_mode must be one of "
                 + ", ".join(repr(mode) for mode in UPSTREAM_AUTH_MODES)
             )
+        normalized_model_pricing: dict[str, UpstreamModelPricingConfig] = {}
+        for model_name, pricing in self.model_pricing.items():
+            normalized_name = model_name.strip()
+            if not normalized_name:
+                raise ValueError("upstream_llm.model_pricing keys must not be empty")
+            normalized_model_pricing[normalized_name] = pricing
+        self.model_pricing = normalized_model_pricing
         return self
 
 

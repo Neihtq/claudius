@@ -3,9 +3,11 @@ import os
 
 import httpx
 from click.testing import CliRunner
+import pytest
 from unittest.mock import MagicMock, patch
 
-from claudius.cli import cli
+from claudius.cli import _validate_workflow_models_against_upstream_pricing, cli
+from claudius.config.schema import WorkflowConfig
 
 def test_cli_help():
     runner = CliRunner()
@@ -87,3 +89,23 @@ def test_session_history_surfaces_http_errors():
 
     assert result.exit_code != 0
     assert "history fetch failed: boom" in result.output
+
+
+def test_validate_workflow_models_against_upstream_pricing_rejects_unknown_models():
+    workflows = [
+        WorkflowConfig.model_validate({
+            "name": "test-workflow",
+            "routing": {"channels": ["email"]},
+            "claude": {"model": "unknown-model", "system_prompt": "x"},
+        })
+    ]
+    with pytest.raises(Exception, match="Unknown workflow model"):
+        _validate_workflow_models_against_upstream_pricing(
+            workflows,
+            {
+                "known-model": {
+                    "input_cost_per_million_tokens_usd": 0.6,
+                    "output_cost_per_million_tokens_usd": 1.2,
+                }
+            },
+        )

@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from claudius.controller.proxy import (
     _extract_reported_cost_usd,
+    _extract_request_model,
     _extract_response_id,
     _extract_usage_counts,
     _format_body_for_log,
@@ -259,6 +260,13 @@ def test_openai_upstream_sets_bearer_auth():
     _, adapted_headers, _ = upstream.adapter.adapt_request("v1/messages", {"content-type": "application/json"}, b"")
     authed = upstream.apply_auth(adapted_headers)
     assert authed["authorization"] == "Bearer cerebras-key"
+    assert authed["accept-encoding"] == "identity"
+
+
+def test_anthropic_upstream_forces_identity_encoding():
+    upstream = build_proxy_upstream("anthropic", "https://api.anthropic.com", "real-key", "x-api-key")
+    authed = upstream.apply_auth({"accept-encoding": "gzip, br"})
+    assert authed["accept-encoding"] == "identity"
 
 
 def test_format_body_for_log_pretty_prints_json():
@@ -292,6 +300,11 @@ def test_extract_usage_counts_reads_anthropic_usage_payload():
         "cache_creation_input_tokens": 7,
         "cache_read_input_tokens": 3,
     }
+
+
+def test_extract_request_model_reads_json_model():
+    body = json.dumps({"model": "qwen-3-235b-a22b-instruct-2507"}).encode()
+    assert _extract_request_model(body, "application/json") == "qwen-3-235b-a22b-instruct-2507"
 
 
 def test_extract_response_id_from_json():
@@ -396,3 +409,137 @@ def test_extract_reported_cost_usd_reads_nested_cost_usd_field():
     }).encode()
 
     assert _extract_reported_cost_usd(body, "application/json") == 0.03125
+
+
+@pytest.mark.asyncio
+async def test_proxy_computes_local_cost_from_model_pricing(monkeypatch):
+    app, db = _make_logged_app()
+    token = mint_token("sess-xyz", SECRET)
+    real_async_client = httpx.AsyncClient
+    response_payload = {
+        "id": "chatcmpl_123",
+        "usage": {
+            "prompt_tokens": 1200,
+            "completion_tokens": 300,
+            "total_tokens": 1500,
+        },
+    }
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *, method, url, headers, content, params):
+            return httpx.Request(method=method, url=url, headers=headers, content=content, params=params)
+
+        async def send(self, request, stream=True):
+            return httpx.Response(200, json=response_payload, request=request)
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    app = FastAPI()
+    db = AsyncMock()
+    db.is_execution_active = AsyncMock(return_value=True)
+    db.get_active_execution = AsyncMock(return_value=type("ExecutionRef", (), {"execution_id": "exec-1"})())
+    db.get_execution = AsyncMock(return_value=type(
+        "ExecutionPayload",
+        (),
+        {
+            "execution_id": "exec-1",
+            "session_id": "sess-xyz",
+            "worker_address": None,
+            "started_at": datetime.now(timezone.utc),
+            "halted_at": None,
+            "halt_reason": None,
+            "phase": type("Phase", (), {"value": "running"})(),
+            "runtime_container": None,
+            "worker_container": None,
+            "exit_code": None,
+            "claude_session_id": None,
+            "claude_num_turns": None,
+            "claude_duration_ms": None,
+            "claude_total_cost_usd": None,
+            "claude_input_tokens": 0,
+            "claude_output_tokens": 0,
+            "claude_cache_creation_input_tokens": 0,
+            "claude_cache_read_input_tokens": 0,
+            "claude_total_tokens": 0,
+            "agent_error_category": None,
+            "agent_error_reason": None,
+        },
+    )())
+    create_proxy_routes(
+        app,
+        db,
+        build_proxy_upstream(
+            "openai",
+            "https://api.cerebras.ai/v1",
+            "cerebras-key",
+            "bearer",
+            model_pricing={
+                "qwen-3-235b-a22b-instruct-2507": {
+                    "input_cost_per_million_tokens_usd": 0.6,
+                    "output_cost_per_million_tokens_usd": 1.2,
+                }
+            },
+        ),
+        secret=SECRET,
+        log_conversation=True,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with real_async_client(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/proxy/v1/messages",
+            headers={"x-api-key": token},
+            json={"model": "qwen-3-235b-a22b-instruct-2507", "messages": []},
+        )
+
+    assert resp.status_code == 200
+    db.increment_execution_token_usage.assert_awaited_once_with(
+        "exec-1",
+        input_tokens=1200,
+        output_tokens=300,
+        cache_creation_input_tokens=0,
+        cache_read_input_tokens=0,
+        total_cost_usd=pytest.approx(0.00108),
+    )
+
+
+@pytest.mark.asyncio
+async def test_proxy_rejects_unknown_model_when_model_pricing_is_configured():
+    app = FastAPI()
+    db = AsyncMock()
+    db.is_execution_active = AsyncMock(return_value=True)
+    create_proxy_routes(
+        app,
+        db,
+        build_proxy_upstream(
+            "openai",
+            "https://api.cerebras.ai/v1",
+            "cerebras-key",
+            "bearer",
+            model_pricing={
+                "known-model": {
+                    "input_cost_per_million_tokens_usd": 0.6,
+                    "output_cost_per_million_tokens_usd": 1.2,
+                }
+            },
+        ),
+        secret=SECRET,
+    )
+    token = mint_token("sess-xyz", SECRET)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.post(
+            "/proxy/v1/messages",
+            headers={"x-api-key": token},
+            json={"model": "unknown-model", "messages": []},
+        )
+
+    assert resp.status_code == 400
+    assert "unknown upstream model 'unknown-model'" in resp.json()["detail"]

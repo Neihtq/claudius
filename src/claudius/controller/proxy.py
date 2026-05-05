@@ -21,6 +21,10 @@ _OPENROUTER_GENERATION_RETRY_DELAY = 1.0
 _TEXTUAL_CONTENT_TYPES = ("application/json", "text/")
 
 
+class UnknownUpstreamModelError(ValueError):
+    pass
+
+
 class ProxyUpstream:
     def __init__(
         self,
@@ -29,12 +33,14 @@ class ProxyUpstream:
         api_key: str,
         auth_mode: str,
         adapter: MessageFormatAdapter,
+        model_pricing: dict[str, dict[str, float]] | None = None,
     ):
         self.kind = kind
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.auth_mode = auth_mode
         self.adapter = adapter
+        self.model_pricing = dict(model_pricing or {})
 
     def url_for(self, path: str) -> str:
         return f"{self.base_url}/{path}"
@@ -62,14 +68,58 @@ class ProxyUpstream:
                 logger.debug(f"openrouter cost fetch attempt={attempt} id={response_id!r} error={exc!r}")
         return None
 
+    def ensure_known_model(self, model_name: str | None) -> str | None:
+        if not self.model_pricing:
+            return model_name
+        normalized_model = (model_name or "").strip()
+        if not normalized_model:
+            raise UnknownUpstreamModelError("request model is required when upstream_llm.model_pricing is set")
+        if normalized_model not in self.model_pricing:
+            raise UnknownUpstreamModelError(
+                f"unknown upstream model {normalized_model!r}; configure it under upstream_llm.model_pricing"
+            )
+        return normalized_model
 
-def build_proxy_upstream(kind: str, base_url: str, api_key: str, auth_mode: str = "none") -> ProxyUpstream:
+    def compute_cost_usd(self, model_name: str | None, usage_counts: dict[str, int] | None) -> float | None:
+        if not usage_counts:
+            return None
+        normalized_model = self.ensure_known_model(model_name)
+        if normalized_model is None:
+            return None
+        pricing = self.model_pricing.get(normalized_model)
+        if pricing is None:
+            return None
+        input_tokens = usage_counts["input_tokens"] + usage_counts["cache_creation_input_tokens"]
+        output_tokens = usage_counts["output_tokens"]
+        return (
+            (input_tokens / 1_000_000) * pricing["input_cost_per_million_tokens_usd"]
+            + (output_tokens / 1_000_000) * pricing["output_cost_per_million_tokens_usd"]
+        )
+
+
+def build_proxy_upstream(
+    kind: str,
+    base_url: str,
+    api_key: str,
+    auth_mode: str = "none",
+    model_pricing: dict[str, dict[str, float]] | None = None,
+) -> ProxyUpstream:
     adapter: MessageFormatAdapter = AnthropicAdapter() if kind == "anthropic" else OpenAIAdapter()
-    return ProxyUpstream(kind=kind, base_url=base_url, api_key=api_key, auth_mode=auth_mode, adapter=adapter)
+    return ProxyUpstream(
+        kind=kind,
+        base_url=base_url,
+        api_key=api_key,
+        auth_mode=auth_mode,
+        adapter=adapter,
+        model_pricing=model_pricing,
+    )
 
 
 def _apply_api_key_auth(headers: dict[str, str], api_key: str, auth_mode: str) -> dict[str, str]:
     rewritten_headers = dict(headers)
+    # We strip content-encoding on proxied responses, so ask upstreams for identity
+    # encoding to keep error and streaming payloads readable end-to-end.
+    rewritten_headers["accept-encoding"] = "identity"
     if auth_mode == "x-api-key":
         if api_key:
             rewritten_headers["x-api-key"] = api_key
@@ -116,6 +166,20 @@ def _format_body_for_log(body: bytes, content_type: str | None) -> str:
     if any(content_type.startswith(prefix) for prefix in _TEXTUAL_CONTENT_TYPES) or not content_type:
         return body.decode("utf-8", errors="replace")
     return f"[non-text body omitted: {content_type or 'unknown content-type'}; {len(body)} bytes]"
+
+
+def _extract_request_model(body: bytes, content_type: str | None) -> str | None:
+    content_type = (content_type or "").lower()
+    if _JSON_CT not in content_type:
+        return None
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    model_name = payload.get("model")
+    return model_name if isinstance(model_name, str) and model_name.strip() else None
 
 
 def _extract_usage_counts(body: bytes, content_type: str | None) -> dict[str, int] | None:
@@ -247,6 +311,22 @@ def _extract_response_id(body: bytes) -> str | None:
     except Exception:
         pass
     return None
+
+
+async def _resolve_cost_usd(
+    upstream: ProxyUpstream,
+    request_model: str | None,
+    response_body: bytes,
+    content_type: str | None,
+    usage_counts: dict[str, int] | None,
+) -> float | None:
+    reported_cost_usd = _extract_reported_cost_usd(response_body, content_type)
+    if reported_cost_usd is not None:
+        return reported_cost_usd
+    reported_cost_usd = await upstream.fetch_cost_usd(_extract_response_id(response_body))
+    if reported_cost_usd is not None:
+        return reported_cost_usd
+    return upstream.compute_cost_usd(request_model, usage_counts)
 
 
 async def _record_proxy_log(
@@ -390,6 +470,11 @@ def create_proxy_routes(
         original_headers = dict(headers)
         original_body = body
         adapted_path, adapted_headers, adapted_body = upstream.adapter.adapt_request(path, headers, body)
+        request_model = _extract_request_model(adapted_body, adapted_headers.get("content-type"))
+        try:
+            request_model = upstream.ensure_known_model(request_model)
+        except UnknownUpstreamModelError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         authed_headers = upstream.apply_auth(adapted_headers)
         upstream_url = upstream.url_for(adapted_path)
         if log_conversation:
@@ -521,9 +606,12 @@ def create_proxy_routes(
                     response_body = b"".join(response_chunks)
                     content_type = resp.headers.get("content-type")
                     usage_counts = _extract_usage_counts(response_body, content_type)
-                    reported_cost_usd = (
-                        _extract_reported_cost_usd(response_body, content_type)
-                        or await upstream.fetch_cost_usd(_extract_response_id(response_body))
+                    reported_cost_usd = await _resolve_cost_usd(
+                        upstream,
+                        request_model,
+                        response_body,
+                        content_type,
+                        usage_counts,
                     )
                     total_tokens = (
                         usage_counts["input_tokens"]

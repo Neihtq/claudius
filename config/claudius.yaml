@@ -35,3 +35,16 @@ upstream_llm:
   base_url: https://api.cerebras.ai/v1
   api_key_env: CEREBRAS_API_KEY
   auth_mode: bearer
+  model_pricing:
+    zai-glm-4.7:
+      input_cost_per_million_tokens_usd: 2.25
+      output_cost_per_million_tokens_usd: 2.75
+    gpt-oss-120b:
+      input_cost_per_million_tokens_usd: 0.35
+      output_cost_per_million_tokens_usd: 0.75
+    qwen-3-235b-a22b-instruct-2507:
+      input_cost_per_million_tokens_usd: 0.6
+      output_cost_per_million_tokens_usd: 1.2
+    llama3.1-8b:
+      input_cost_per_million_tokens_usd: 0.1
+      output_cost_per_million_tokens_usd: 0.1

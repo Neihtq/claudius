@@ -25,6 +25,18 @@ def _collect_explicit_serve_overrides(ctx: click.Context, option_values: dict[st
     return overrides
 
 
+def _validate_workflow_models_against_upstream_pricing(workflows, pricing: dict[str, object]) -> None:
+    if not pricing:
+        return
+    unknown_models = sorted({workflow.claude.model for workflow in workflows if workflow.claude.model not in pricing})
+    if not unknown_models:
+        return
+    raise click.ClickException(
+        "Unknown workflow model(s) for upstream_llm.model_pricing: "
+        + ", ".join(repr(model) for model in unknown_models)
+    )
+
+
 @click.group()
 def cli():
     """Claudius — message-driven agentic platform."""
@@ -116,6 +128,10 @@ def serve(
     )
 
     workflows = load_workflows(Path(serve_config.config_dir))
+    _validate_workflow_models_against_upstream_pricing(
+        workflows,
+        serve_config.upstream_llm.model_pricing,
+    )
     db_path = serve_config.db_path
     workspaces_path = str(Path(serve_config.workspaces_path).expanduser().resolve())
     image = serve_config.image
@@ -134,6 +150,10 @@ def serve(
         base_url=proxy_upstream_url,
         api_key=upstream_api_key,
         auth_mode=serve_config.upstream_llm.auth_mode,
+        model_pricing={
+            model_name: pricing.model_dump()
+            for model_name, pricing in serve_config.upstream_llm.model_pricing.items()
+        },
     )
 
     resend_api_key = os.environ.get("RESEND_API_KEY", "")
