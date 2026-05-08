@@ -29,6 +29,7 @@ def _ctx() -> TemplateContext:
         request=InboundMessage(
             channel="email",
             sender="user@example.com",
+            recipients=["edit@example.com"],
             thread_id="thread-123",
             subject="hello",
             body="body",

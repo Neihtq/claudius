@@ -309,16 +309,22 @@ class SessionManager:
             self._clear_execution_bookkeeping(execution.execution_id)
             self._tail_tasks.pop(execution.execution_id, None)
 
-        if stop_request and not stop_request.restart_if_pending:
-            await self._db.update_session_state(execution.session_id, stop_request.final_state)
-            if self._broker:
-                await self._broker.publish(execution.session_id, {
-                    "type": "status",
-                    "state": stop_request.final_state.value,
-                })
+        if stop_request:
+            if stop_request.restart_if_pending:
+                await self._resume_or_transition(
+                    execution.session_id,
+                    stop_request.final_state,
+                )
+            else:
+                await self._db.update_session_state(execution.session_id, stop_request.final_state)
+                if self._broker:
+                    await self._broker.publish(execution.session_id, {
+                        "type": "status",
+                        "state": stop_request.final_state.value,
+                    })
             return
 
-        await self._resume_or_hibernate(execution.session_id)
+        await self._resume_or_transition(execution.session_id, SessionState.HIBERNATED)
 
     # -------------------------------------------------------------------------
     # Public API
@@ -329,6 +335,9 @@ class SessionManager:
 
         if session is None:
             return await self._create_session(message)
+
+        await self._refresh_session_channel_metadata(session.session_id, message)
+        session = await self._db.get_session(session.session_id) or session
 
         if session.state == SessionState.HIBERNATED:
             await self._store_inbound_message(
@@ -431,7 +440,7 @@ class SessionManager:
                 "execution": self._serialize_execution(refreshed_execution),
             })
         if restart_if_pending:
-            await self._resume_or_hibernate(session_id)
+            await self._resume_or_transition(session_id, final_state)
         else:
             await self._db.update_session_state(session_id, final_state)
             if self._broker:
@@ -468,6 +477,87 @@ class SessionManager:
 
     async def get_messages(self, session_id: str) -> list[dict]:
         return await self._db.list_messages(session_id)
+
+    async def delete_pending_message(self, session_id: str, message_id: str) -> None:
+        messages = await self._db.list_messages(session_id)
+        message = next((item for item in messages if item["message_id"] == message_id), None)
+        if message is None:
+            raise ValueError(f"Message {message_id} not found")
+        if message["direction"] != "inbound" or message["delivery_status"] != "pending":
+            raise RuntimeError("Only pending inbound messages can be deleted")
+
+        deleted = await self._db.delete_pending_message(session_id, message_id)
+        if deleted is None:
+            raise RuntimeError("Message is no longer pending")
+
+        if self._attachment_store is not None:
+            for storage_key in deleted.get("storage_keys", []):
+                try:
+                    await self._attachment_store.delete(storage_key)
+                except Exception as exc:
+                    logger.warning(
+                        "failed to delete attachment for pending message session_id={} message_id={} key={} error={}",
+                        session_id,
+                        message_id,
+                        storage_key,
+                        exc,
+                    )
+
+        if self._broker:
+            await self._broker.publish(session_id, {
+                "type": "message_deleted",
+                "message_id": message_id,
+            })
+
+    async def resend_outbound_message(self, session_id: str, message_id: str) -> None:
+        message = await self._db.get_message(session_id, message_id)
+        if message is None:
+            raise ValueError(f"Message {message_id} not found")
+        if message["direction"] != "outbound":
+            raise RuntimeError("Only outbound messages can be resent")
+
+        session = await self._db.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Session {session_id} not found")
+        channel = self._channels.get(session.channel)
+        if channel is None:
+            raise RuntimeError(f"Channel {session.channel!r} is not configured")
+
+        messages = await self._db.list_messages(session_id)
+        reply_to = next(
+            (
+                item["sender"]
+                for item in messages
+                if item["direction"] == "inbound" and item.get("sender")
+            ),
+            "",
+        )
+        if not reply_to:
+            raise RuntimeError("No inbound sender found for this session")
+
+        attachments: list[Attachment] = []
+        for attachment in message.get("attachments", []):
+            filename = attachment.get("filename")
+            if not isinstance(filename, str) or not filename:
+                continue
+            if self._attachment_store is None:
+                raise RuntimeError("No attachment store configured")
+            stored = await self._db.get_attachment_by_name(message_id, filename)
+            if stored is None:
+                raise RuntimeError(f"Attachment {filename!r} not found for message")
+            data = await self._attachment_store.read(stored["storage_key"])
+            attachments.append(Attachment(
+                filename=filename,
+                content_type=stored["content_type"],
+                data=data,
+            ))
+
+        await channel.send_message(
+            to=reply_to,
+            body=message["body"],
+            thread_id=session.thread_id,
+            attachments=attachments,
+        )
 
     async def get_session_history(
         self,
@@ -692,6 +782,57 @@ class SessionManager:
                 },
             )
 
+        session = await self._db.get_session(session_id)
+        if session is None:
+            logger.warning("cannot deliver outbound message for missing session session_id={}", session_id)
+            return
+        channel = self._channels.get(session.channel)
+        if channel is None:
+            logger.warning(
+                "cannot deliver outbound message: channel not configured session_id={} channel={}",
+                session_id,
+                session.channel,
+            )
+            return
+
+        messages = await self._db.list_messages(session_id)
+        reply_to = next(
+            (
+                message["sender"]
+                for message in messages
+                if message["direction"] == "inbound" and message.get("sender")
+            ),
+            "",
+        )
+        if not reply_to:
+            logger.warning(
+                "cannot deliver outbound message: no inbound sender found session_id={}",
+                session_id,
+            )
+            return
+
+        try:
+            await channel.send_message(
+                to=reply_to,
+                body=body,
+                thread_id=session.thread_id,
+                attachments=atts,
+            )
+            logger.info(
+                "outbound message delivered session_id={} channel={} to={}",
+                session_id,
+                session.channel,
+                reply_to,
+            )
+        except Exception as exc:
+            logger.exception(
+                "failed to deliver outbound message session_id={} channel={} to={} error={}",
+                session_id,
+                session.channel,
+                reply_to,
+                exc,
+            )
+
     async def continue_session(
         self, session_id: str, body: str, attachments: list | None = None
     ) -> dict:
@@ -828,7 +969,11 @@ class SessionManager:
         workflow = match_workflow(message, self._workflows)
         if workflow is None:
             raise NoWorkflowMatch(
-                f"No workflow matches channel={message.channel} sender={message.sender}"
+                "No workflow matches "
+                f"channel={message.channel} "
+                f"sender={message.sender} "
+                f"recipients={message.recipients} "
+                f"subject={message.subject!r}"
             )
 
         session_id = str(uuid.uuid4())
@@ -844,6 +989,7 @@ class SessionManager:
             workspace_path=str(workspace.path),
             created_at=datetime.now(timezone.utc),
             last_message_at=datetime.now(timezone.utc),
+            channel_metadata=self._channel_metadata_for_message(message),
         )
         await self._db.create_session(session)
         logger.info(
@@ -978,6 +1124,7 @@ class SessionManager:
         initial_msg = InboundMessage(
             channel=session.channel,
             sender=first["sender"],
+            recipients=[],
             thread_id=session.thread_id,
             subject=None,
             body=first["body"],
@@ -1095,6 +1242,7 @@ class SessionManager:
             "CLAUDIUS_INITIAL_MESSAGE": json.dumps({
                 "channel": message.channel,
                 "sender": message.sender,
+                "recipients": message.recipients,
                 "thread_id": message.thread_id,
                 "subject": message.subject,
                 "body": message.body,
@@ -1290,7 +1438,11 @@ class SessionManager:
         )
         await self._publish_conversation_event(session_id, event)
 
-    async def _resume_or_hibernate(self, session_id: str) -> None:
+    async def _resume_or_transition(
+        self,
+        session_id: str,
+        final_state: SessionState,
+    ) -> None:
         pending = await self._db.get_pending_inbound_messages(session_id)
         if pending:
             logger.info(
@@ -1305,12 +1457,31 @@ class SessionManager:
                     logger.error(
                         f"failed to restart for pending messages session_id={session_id} error={e}"
                     )
-        await self._db.update_session_state(session_id, SessionState.HIBERNATED)
+        await self._db.update_session_state(session_id, final_state)
         if self._broker:
             await self._broker.publish(session_id, {
                 "type": "status",
-                "state": SessionState.HIBERNATED.value,
+                "state": final_state.value,
             })
+
+    def _channel_metadata_for_message(self, message: InboundMessage) -> dict:
+        metadata: dict[str, object] = {"thread_id": message.thread_id}
+        if message.sender:
+            metadata["sender"] = message.sender
+        if message.recipients:
+            metadata["recipients"] = list(message.recipients)
+        if message.subject:
+            metadata["subject"] = message.subject
+        return metadata
+
+    async def _refresh_session_channel_metadata(self, session_id: str, message: InboundMessage) -> None:
+        session = await self._db.get_session(session_id)
+        if session is None:
+            return
+        next_metadata = dict(session.channel_metadata)
+        next_metadata.update(self._channel_metadata_for_message(message))
+        if next_metadata != session.channel_metadata:
+            await self._db.update_session_channel_metadata(session_id, next_metadata)
 
     async def _publish_message_event(self, session_id: str, message: dict) -> None:
         if self._broker:

@@ -65,6 +65,13 @@ def resolve_startup_config(
 
 
 def load_workflows(path: Path) -> list[WorkflowConfig]:
+    return load_workflows_with_defaults(path, None)
+
+
+def load_workflows_with_defaults(
+    path: Path,
+    startup_config: StartupConfig | None,
+) -> list[WorkflowConfig]:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config path not found: {path}")
@@ -75,10 +82,16 @@ def load_workflows(path: Path) -> list[WorkflowConfig]:
         files = sorted(path.glob("*.yaml")) + sorted(path.glob("*.yml"))
 
     workflows = []
+    default_email_to = None
+    if startup_config is not None and startup_config.channels.email.provider == "resend":
+        default_email_to = startup_config.channels.email.from_address
     for f in files:
         raw = yaml.safe_load(f.read_text())
         try:
-            workflows.append(WorkflowConfig.model_validate(raw))
+            workflow = WorkflowConfig.model_validate(raw)
         except ValidationError as e:
             raise ConfigError(f"Invalid workflow config in {f}: {e}") from e
+        if default_email_to and "email" in workflow.routing.channels and not workflow.routing.to:
+            workflow.routing.to = [default_email_to]
+        workflows.append(workflow)
     return workflows

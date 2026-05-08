@@ -7,6 +7,7 @@ def test_inbound_message_fields():
     msg = InboundMessage(
         channel="email",
         sender="user@example.com",
+        recipients=["edit@example.com"],
         thread_id="thread-123",
         subject="Hello",
         body="Hi there",

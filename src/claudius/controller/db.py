@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     workspace_path TEXT NOT NULL,
     created_at TEXT NOT NULL,
     last_message_at TEXT NOT NULL,
-    last_execution_result TEXT
+    last_execution_result TEXT,
+    channel_metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS executions (
     execution_id TEXT PRIMARY KEY,
@@ -217,6 +218,7 @@ class Database:
             "ALTER TABLE executions ADD COLUMN claude_cache_read_input_tokens INTEGER",
             "ALTER TABLE executions ADD COLUMN claude_total_tokens INTEGER",
             "ALTER TABLE sessions ADD COLUMN last_execution_result TEXT",
+            "ALTER TABLE sessions ADD COLUMN channel_metadata_json TEXT NOT NULL DEFAULT '{}'",
             "ALTER TABLE executions ADD COLUMN agent_error_category TEXT",
             "ALTER TABLE executions ADD COLUMN agent_error_reason TEXT",
             "ALTER TABLE proxy_logs ADD COLUMN request_id TEXT",
@@ -247,12 +249,12 @@ class Database:
         await self._conn.execute(
             "INSERT INTO sessions "
             "(session_id, thread_id, channel, workflow_name, state, workspace_path, "
-            "created_at, last_message_at, last_execution_result) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "created_at, last_message_at, last_execution_result, channel_metadata_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (session.session_id, session.thread_id, session.channel,
              session.workflow_name, session.state.value, session.workspace_path,
              session.created_at.isoformat(), session.last_message_at.isoformat(),
-             session.last_execution_result),
+             session.last_execution_result, json.dumps(session.channel_metadata)),
         )
         await self._conn.commit()
 
@@ -290,6 +292,7 @@ class Database:
             created_at=_dt(row["created_at"]), last_message_at=_dt(row["last_message_at"]),
             last_execution_result=row["last_execution_result"],
             claude_summary=summary,
+            channel_metadata=await self._get_effective_channel_metadata(row),
         )
 
     async def get_session(self, session_id: str) -> Session | None:
@@ -307,6 +310,7 @@ class Database:
             created_at=_dt(row["created_at"]), last_message_at=_dt(row["last_message_at"]),
             last_execution_result=row["last_execution_result"],
             claude_summary=summary,
+            channel_metadata=await self._get_effective_channel_metadata(row),
         )
 
     async def update_session_state(self, session_id: str, state: SessionState) -> None:
@@ -325,6 +329,13 @@ class Database:
         )
         await self._conn.commit()
 
+    async def update_session_channel_metadata(self, session_id: str, metadata: dict) -> None:
+        await self._conn.execute(
+            "UPDATE sessions SET channel_metadata_json = ? WHERE session_id = ?",
+            (json.dumps(metadata), session_id),
+        )
+        await self._conn.commit()
+
     async def list_sessions(self) -> list[Session]:
         cur = await self._conn.execute("SELECT * FROM sessions ORDER BY created_at DESC")
         rows = await cur.fetchall()
@@ -337,8 +348,30 @@ class Database:
                 created_at=_dt(r["created_at"]), last_message_at=_dt(r["last_message_at"]),
                 last_execution_result=r["last_execution_result"],
                 claude_summary=await self.get_session_claude_summary(r["session_id"]),
+                channel_metadata=await self._get_effective_channel_metadata(r),
             ))
         return sessions
+
+    async def _get_effective_channel_metadata(self, row) -> dict:
+        metadata = self._parse_channel_metadata(row["channel_metadata_json"])
+        if not metadata.get("sender"):
+            cur = await self._conn.execute(
+                "SELECT sender FROM messages "
+                "WHERE session_id = ? AND direction = 'inbound' AND sender != '' "
+                "ORDER BY received_at LIMIT 1",
+                (row["session_id"],),
+            )
+            sender_row = await cur.fetchone()
+            if sender_row and sender_row["sender"]:
+                metadata["sender"] = sender_row["sender"]
+        return metadata
+
+    def _parse_channel_metadata(self, raw: str | None) -> dict:
+        try:
+            metadata = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            metadata = {}
+        return metadata if isinstance(metadata, dict) else {}
 
     async def create_execution(self, execution: Execution) -> None:
         await self._conn.execute(
@@ -800,6 +833,58 @@ class Database:
             for r in rows
         ]
 
+    async def delete_pending_message(self, session_id: str, message_id: str) -> dict | None:
+        async with self._conn.execute(
+            "SELECT message_id, body, sender, received_at, attachments "
+            "FROM messages "
+            "WHERE session_id = ? AND message_id = ? "
+            "AND direction = 'inbound' AND acknowledged_at IS NULL",
+            (session_id, message_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+
+        async with self._conn.execute(
+            "SELECT storage_key FROM attachments WHERE message_id = ?",
+            (message_id,),
+        ) as cur:
+            attachment_rows = await cur.fetchall()
+        storage_keys = [r["storage_key"] for r in attachment_rows]
+
+        await self._conn.execute(
+            "DELETE FROM attachments WHERE message_id = ?",
+            (message_id,),
+        )
+        await self._conn.execute(
+            "DELETE FROM messages WHERE session_id = ? AND message_id = ?",
+            (session_id, message_id),
+        )
+
+        async with self._conn.execute(
+            "SELECT COALESCE(MAX(m.received_at), s.created_at) AS last_message_at "
+            "FROM sessions s "
+            "LEFT JOIN messages m ON m.session_id = s.session_id "
+            "WHERE s.session_id = ?",
+            (session_id,),
+        ) as cur:
+            last_row = await cur.fetchone()
+        await self._conn.execute(
+            "UPDATE sessions SET last_message_at = ? WHERE session_id = ?",
+            (last_row["last_message_at"], session_id),
+        )
+        await self._conn.commit()
+
+        return {
+            "message_id": row["message_id"],
+            "direction": "inbound",
+            "body": row["body"],
+            "sender": row["sender"],
+            "received_at": row["received_at"],
+            "attachments": json.loads(row["attachments"]),
+            "storage_keys": storage_keys,
+        }
+
     async def store_attachment(
         self, message_id: str, filename: str, content_type: str, storage_key: str
     ) -> str:
@@ -912,7 +997,7 @@ class Database:
 
     async def list_messages(self, session_id: str) -> list[dict]:
         cur = await self._conn.execute(
-            "SELECT message_id, direction, body, received_at, attachments, acknowledged_at, delivery_error "
+            "SELECT message_id, direction, body, sender, received_at, attachments, acknowledged_at, delivery_error "
             "FROM messages "
             "WHERE session_id = ? ORDER BY received_at",
             (session_id,),
@@ -923,6 +1008,7 @@ class Database:
                 "message_id": r["message_id"],
                 "direction": r["direction"],
                 "body": r["body"],
+                "sender": r["sender"],
                 "received_at": r["received_at"],
                 "attachments": json.loads(r["attachments"]),
                 "acknowledged_at": r["acknowledged_at"],
@@ -939,3 +1025,33 @@ class Database:
             }
             for r in rows
         ]
+
+    async def get_message(self, session_id: str, message_id: str) -> dict | None:
+        cur = await self._conn.execute(
+            "SELECT message_id, direction, body, sender, received_at, attachments, acknowledged_at, delivery_error "
+            "FROM messages "
+            "WHERE session_id = ? AND message_id = ?",
+            (session_id, message_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "message_id": row["message_id"],
+            "direction": row["direction"],
+            "body": row["body"],
+            "sender": row["sender"],
+            "received_at": row["received_at"],
+            "attachments": json.loads(row["attachments"]),
+            "acknowledged_at": row["acknowledged_at"],
+            "delivery_error": row["delivery_error"],
+            "delivery_status": (
+                "failed"
+                if row["direction"] == "inbound" and row["delivery_error"]
+                else (
+                    "pending"
+                    if row["direction"] == "inbound" and row["acknowledged_at"] is None
+                    else "acknowledged"
+                )
+            ),
+        }

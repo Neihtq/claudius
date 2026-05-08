@@ -6,6 +6,8 @@ import {
   getSession,
   listExecutions,
   sendMessage,
+  deletePendingMessage,
+  resendOutboundMessage,
   stopExecution,
   subscribeToSession,
 } from '../api'
@@ -77,6 +79,18 @@ function acknowledgeMessage(messages: Message[], messageId: string, acknowledged
         }
       : message,
   )
+}
+
+function removeMessage(messages: Message[], messageId: string): Message[] {
+  return messages.filter((message) => message.message_id !== messageId)
+}
+
+function formatMetadataValue(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (Array.isArray(value)) return value.map((item) => formatMetadataValue(item)).join(', ')
+  if (value && typeof value === 'object') return JSON.stringify(value)
+  return ''
 }
 
 function buildTimeline(
@@ -267,6 +281,8 @@ export default function Conversation() {
             delivery_error: event.delivery_error,
           }),
         )
+      } else if (event.type === 'message_deleted') {
+        setMessages((prev) => removeMessage(prev, event.message_id))
       } else if (event.type === 'message_acknowledged') {
         setMessages((prev) => acknowledgeMessage(prev, event.message_id, event.acknowledged_at))
         setFollowupHint((prev) =>
@@ -346,6 +362,34 @@ export default function Conversation() {
     }
   }
 
+  const handleDeletePendingMessage = async (messageId: string) => {
+    if (!sessionId) return
+    try {
+      await deletePendingMessage(sessionId, messageId)
+      setMessages((prev) => removeMessage(prev, messageId))
+    } catch (e) {
+      if (e instanceof ApiError) {
+        setSendError(e.message)
+      } else {
+        setSendError('Failed to delete pending message.')
+      }
+    }
+  }
+
+  const handleResendOutboundMessage = async (messageId: string) => {
+    if (!sessionId) return
+    try {
+      setSendError(null)
+      await resendOutboundMessage(sessionId, messageId)
+    } catch (e) {
+      if (e instanceof ApiError) {
+        setSendError(e.message)
+      } else {
+        setSendError('Failed to resend message.')
+      }
+    }
+  }
+
   const handleStop = async () => {
     if (stopping || !sessionId) return
     setStopping(true)
@@ -381,6 +425,9 @@ export default function Conversation() {
 
   const timeline = buildTimeline(messages, executions, executionActivityAt)
   const hasActiveExecution = executions.some((execution) => execution.halted_at === null)
+  const channelMetadataEntries = session
+    ? Object.entries(session.channel_metadata ?? {}).filter(([, value]) => formatMetadataValue(value))
+    : []
 
   // Find the execution for the log panel based on the URL param
   const logExecution = executionId
@@ -457,6 +504,21 @@ export default function Conversation() {
         )}
       </div>
 
+      {session && channelMetadataEntries.length > 0 && (
+        <div className="px-6 py-2 border-b border-gray-800 bg-gray-900/60">
+          <div className="flex flex-wrap gap-2 text-xs">
+            <span className="rounded bg-gray-800 px-2 py-1 text-gray-400">
+              channel: {session.channel}
+            </span>
+            {channelMetadataEntries.map(([key, value]) => (
+              <span key={key} className="rounded bg-gray-800 px-2 py-1 text-gray-400">
+                {key}: {formatMetadataValue(value)}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Timeline */}
       <div className="flex-1 overflow-y-auto px-6 py-4 flex flex-col gap-3">
         {timeline.map((item, i) => {
@@ -490,6 +552,28 @@ export default function Conversation() {
                       : m.delivery_status === 'failed'
                         ? (m.delivery_error ?? 'Delivery failed before Claude received this message')
                         : 'Acknowledged'}
+                  </div>
+                )}
+                {m.direction === 'inbound' && m.delivery_status === 'pending' && (
+                  <div className="mt-2">
+                    <button
+                      type="button"
+                      onClick={() => handleDeletePendingMessage(m.message_id)}
+                      className="text-[11px] text-red-400 hover:text-red-300 underline underline-offset-2"
+                    >
+                      Delete pending message
+                    </button>
+                  </div>
+                )}
+                {m.direction === 'outbound' && (
+                  <div className="mt-2">
+                    <button
+                      type="button"
+                      onClick={() => handleResendOutboundMessage(m.message_id)}
+                      className="text-[11px] text-blue-400 hover:text-blue-300 underline underline-offset-2"
+                    >
+                      Resend response
+                    </button>
                   </div>
                 )}
                 {m.attachments && m.attachments.length > 0 && (

@@ -18,6 +18,7 @@ dependencies = [
     "click>=8.1.0",
     "loguru>=0.7.0",
     "pyjwt>=2.12.1",
+    "markdown>=3.7",
 ]
 
 [project.scripts]

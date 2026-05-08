@@ -98,7 +98,11 @@ def serve(
 ):
     """Start the Claudius controller."""
     from claudius.channels.resend import ResendChannel
-    from claudius.config.loader import load_startup_config, load_workflows, resolve_startup_config
+    from claudius.config.loader import (
+        load_startup_config,
+        load_workflows_with_defaults,
+        resolve_startup_config,
+    )
     from claudius.controller.attachments import create_store
     from claudius.controller.backends.docker import DockerBackend
     from claudius.controller.db import Database
@@ -127,7 +131,7 @@ def serve(
         }),
     )
 
-    workflows = load_workflows(Path(serve_config.config_dir))
+    workflows = load_workflows_with_defaults(Path(serve_config.config_dir), serve_config)
     _validate_workflow_models_against_upstream_pricing(
         workflows,
         serve_config.upstream_llm.model_pricing,
@@ -163,7 +167,7 @@ def serve(
             f"Unsupported channels.email.provider: {email_channel_config.provider!r}"
         )
     resend_api_key = os.environ.get(resend_provider.api_key_env, "")
-    resend_from = resend_provider.from_address
+    resend_from = email_channel_config.from_address
     channel = ResendChannel(api_key=resend_api_key, from_address=resend_from)
     channels = {"email": channel}
     inbound_webhooks = {resend_provider.webhook_path: "email"}
@@ -278,6 +282,7 @@ def session(session_id, workspaces_path, host, port, idle_timeout):
     initial_message = InboundMessage(
         channel=message_data["channel"],
         sender=message_data["sender"],
+        recipients=list(message_data.get("recipients") or []),
         thread_id=message_data["thread_id"],
         subject=message_data.get("subject"),
         body=message_data["body"],

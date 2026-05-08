@@ -80,6 +80,7 @@ def _message(body="Please do a task"):
     return InboundMessage(
         channel="email",
         sender="user@example.com",
+        recipients=["edit@example.com"],
         thread_id="t1",
         subject="Task",
         body=body,

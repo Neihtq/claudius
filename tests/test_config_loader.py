@@ -1,6 +1,13 @@
 import pytest
 from pathlib import Path
-from claudius.config.loader import ConfigError, load_startup_config, load_workflows, resolve_startup_config
+from claudius.config.loader import (
+    ConfigError,
+    load_startup_config,
+    load_workflows,
+    load_workflows_with_defaults,
+    resolve_startup_config,
+)
+from claudius.config.schema import StartupConfig
 
 FIXTURES = Path(__file__).parent / "fixtures" / "workflows"
 
@@ -33,6 +40,29 @@ def test_load_example_workflow():
     assert "merge_mr_and_close_session" in tool_names
 
 
+def test_load_workflow_defaults_routing_to_from_channel_config(tmp_path):
+    (tmp_path / "wf.yaml").write_text(
+        "name: wf\n"
+        "routing:\n"
+        "  channels: [email]\n"
+        "claude:\n"
+        "  system_prompt: test\n"
+        "response:\n"
+        "  channel: email\n"
+    )
+    startup = StartupConfig.model_validate({
+        "channels": {
+            "email": {
+                "from_address": "edit@rosenstein.app",
+            }
+        }
+    })
+
+    workflows = load_workflows_with_defaults(tmp_path, startup)
+
+    assert workflows[0].routing.to == ["edit@rosenstein.app"]
+
+
 def test_load_startup_config_returns_none_when_missing(tmp_path):
     assert load_startup_config(tmp_path / "claudius.yaml") is None
 
@@ -40,7 +70,8 @@ def test_load_startup_config_returns_none_when_missing(tmp_path):
 def test_load_shipped_startup_config():
     config = load_startup_config(Path("config/claudius.yaml"))
     assert config is not None
-    assert config.upstream_llm.protocol == "openai"
+    assert config.upstream_llm.protocol == "anthropic"
+    assert config.upstream_llm.base_url == "https://openrouter.ai/api"
     assert config.upstream_llm.auth_mode == "bearer"
 
 

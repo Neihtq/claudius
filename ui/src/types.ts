@@ -25,6 +25,7 @@ export interface Session {
   last_message_at: string
   last_execution_result: 'ok' | 'failed' | null
   claude_summary: ClaudeSummary
+  channel_metadata: Record<string, unknown>
 }
 
 export interface MessageAttachment {
@@ -135,6 +136,10 @@ export type SSEEvent =
       message_id: string
       acknowledged_at: string
       delivery_status: 'acknowledged'
+    }
+  | {
+      type: 'message_deleted'
+      message_id: string
     }
   | { type: 'followup'; action: FollowupAction }
   | { type: 'status'; state: SessionState }

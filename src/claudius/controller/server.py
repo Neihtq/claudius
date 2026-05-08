@@ -10,6 +10,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from loguru import logger
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -144,6 +145,7 @@ def _serialize_session(session) -> dict:
         "last_message_at": session.last_message_at.isoformat(),
         "last_execution_result": session.last_execution_result,
         "claude_summary": _serialize_claude_summary(session.claude_summary),
+        "channel_metadata": session.channel_metadata,
     }
 
 
@@ -225,10 +227,25 @@ def create_controller_app(
         if channel is None:
             raise HTTPException(status_code=404, detail=f"Channel not configured: {channel_name}")
         message = await channel.parse_webhook(request)
+        logger.info(
+            "inbound webhook parsed channel={} sender={} recipients={} subject={!r} thread_id={}",
+            message.channel,
+            message.sender,
+            message.recipients,
+            message.subject,
+            message.thread_id,
+        )
         try:
-            await session_manager.handle_message(message)
+            session = await session_manager.handle_message(message)
         except NoWorkflowMatch as e:
+            logger.warning("inbound webhook no_match channel={} detail={}", channel_name, str(e))
             return {"status": "no_match", "detail": str(e)}
+        logger.info(
+            "inbound webhook accepted channel={} session_id={} thread_id={}",
+            channel_name,
+            session.session_id,
+            session.thread_id,
+        )
         return {"status": "accepted"}
 
     def _make_webhook_handler(channel_name: str):
@@ -370,6 +387,26 @@ def create_controller_app(
             "followup_action": result["followup_action"],
         }
 
+    @app.delete("/sessions/{session_id}/messages/{message_id}")
+    async def delete_pending_message(session_id: str, message_id: str):
+        try:
+            await session_manager.delete_pending_message(session_id, message_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Message not found")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return Response(status_code=204)
+
+    @app.post("/sessions/{session_id}/messages/{message_id}/resend")
+    async def resend_outbound_message(session_id: str, message_id: str):
+        try:
+            await session_manager.resend_outbound_message(session_id, message_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Message not found")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"status": "ok"}
+
     @app.post("/dev/inject")
     async def dev_inject(req: _DevInjectRequest):
         thread_id = str(uuid.uuid4())
@@ -387,6 +424,7 @@ def create_controller_app(
         message = InboundMessage(
             channel=req.channel,
             sender=req.sender,
+            recipients=[],
             thread_id=thread_id,
             subject=req.subject,
             body=req.body,

@@ -16,8 +16,7 @@ RESEND_PAYLOAD = {
         "from": "user@example.com",
         "to": ["inbox@claudius.example.com"],
         "subject": "Hello",
-        "text": "Do the thing",
-        "headers": [{"name": "Message-ID", "value": "<msg-001@mail.example.com>"}],
+        "message_id": "<msg-001@mail.example.com>",
         "email_id": "email_001",
     }
 }
@@ -50,7 +49,7 @@ def test_resend_webhook_calls_handle_message():
     manager = AsyncMock()
     channel = AsyncMock(spec=ResendChannel)
     channel.parse_webhook.return_value = InboundMessage(
-        channel="email", sender="user@example.com", thread_id="msg-001",
+        channel="email", sender="user@example.com", recipients=["inbox@claudius.example.com"], thread_id="msg-001",
         subject="Hello", body="Do the thing", attachments=[],
         received_at=datetime.now(timezone.utc),
     )
@@ -229,6 +228,24 @@ def test_post_session_outbound():
     assert args[2][0].filename == "report.txt"
     assert args[2][0].content_type == "text/plain"
     assert args[2][0].data == b"hello"
+
+
+def test_delete_pending_message_endpoint():
+    manager = AsyncMock()
+    app = create_controller_app(session_manager=manager, channels={}, broker=SSEBroker())
+    client = TestClient(app)
+    resp = client.delete("/sessions/sess-001/messages/msg-1")
+    assert resp.status_code == 204
+    manager.delete_pending_message.assert_awaited_once_with("sess-001", "msg-1")
+
+
+def test_resend_outbound_message_endpoint():
+    manager = AsyncMock()
+    app = create_controller_app(session_manager=manager, channels={}, broker=SSEBroker())
+    client = TestClient(app)
+    resp = client.post("/sessions/sess-001/messages/msg-1/resend")
+    assert resp.status_code == 200
+    manager.resend_outbound_message.assert_awaited_once_with("sess-001", "msg-1")
 
 
 def test_post_dev_inject():

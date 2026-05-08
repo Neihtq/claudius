@@ -5,11 +5,14 @@ routing:
   channels: [email]
   from:
     - "*"
+  to:
+    - "edit@example.com"
   subject_patterns:
     - "GitLab:*"
+    - "Re: GitLab:*"
 
 claude:
-  model: qwen-3-235b-a22b-instruct-2507 # z-ai/glm-5-turbo # claude-sonnet-4-6
+  model: claude-sonnet-4-6
   supports_images: false
   system_prompt: |
     You are a software engineering agent working inside /workspace.

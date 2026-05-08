@@ -28,6 +28,27 @@ async def test_create_and_get_session(db):
     assert fetched.session_id == "sess-1"
     assert fetched.state == SessionState.NEW
 
+
+@pytest.mark.asyncio
+async def test_get_session_backfills_sender_into_channel_metadata(db):
+    session = Session(
+        session_id="sess-meta",
+        thread_id="thread-meta",
+        channel="email",
+        workflow_name="test",
+        state=SessionState.NEW,
+        workspace_path="/workspaces/sess-meta",
+        created_at=datetime.now(timezone.utc),
+        last_message_at=datetime.now(timezone.utc),
+    )
+    await db.create_session(session)
+    await db.store_message("sess-meta", "inbound", "hello", sender="user@example.com")
+
+    fetched = await db.get_session("sess-meta")
+
+    assert fetched is not None
+    assert fetched.channel_metadata["sender"] == "user@example.com"
+
 @pytest.mark.asyncio
 async def test_update_session_state(db):
     session = Session(
@@ -125,6 +146,29 @@ async def test_get_pending_inbound_messages_includes_direction(db):
 
     assert len(pending) == 1
     assert pending[0]["direction"] == "inbound"
+
+
+@pytest.mark.asyncio
+async def test_delete_pending_message_removes_message_and_updates_timestamp(db):
+    session = Session(
+        session_id="sess-delete", thread_id="thread-delete", channel="email",
+        workflow_name="test", state=SessionState.HIBERNATED,
+        workspace_path="/workspaces/sess-delete",
+        created_at=datetime.now(timezone.utc),
+        last_message_at=datetime.now(timezone.utc),
+    )
+    await db.create_session(session)
+    first_id = await db.store_message("sess-delete", "outbound", "hello back")
+    pending_id = await db.store_message("sess-delete", "inbound", "remove me", sender="user@example.com")
+    await db.store_attachment(pending_id, "a.txt", "text/plain", "sess-delete/a.txt")
+
+    deleted = await db.delete_pending_message("sess-delete", pending_id)
+
+    assert deleted is not None
+    assert deleted["message_id"] == pending_id
+    assert deleted["storage_keys"] == ["sess-delete/a.txt"]
+    messages = await db.list_messages("sess-delete")
+    assert [message["message_id"] for message in messages] == [first_id]
 
 
 @pytest.mark.asyncio

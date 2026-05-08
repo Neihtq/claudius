@@ -6,6 +6,7 @@ def _ctx():
     msg = InboundMessage(
         channel="email",
         sender="user@example.com",
+        recipients=["edit@example.com"],
         thread_id="thread-abc123",
         subject="GitLab: fix bug",
         body="Please fix it",

@@ -65,6 +65,9 @@ routing:
   channels: [email]
   from:
     - "*@example.com"
+  # If omitted, routing.to defaults to channels.email.from_address from config/claudius.yaml.
+  to:
+    - "edit@example.com"
   subject_patterns:
     - "GitLab:*"
 claude:

@@ -105,6 +105,16 @@ export async function stopExecution(sessionId: string): Promise<void> {
   if (!r.ok) throw new Error(await r.text())
 }
 
+export async function deletePendingMessage(sessionId: string, messageId: string): Promise<void> {
+  const r = await fetch(`/sessions/${sessionId}/messages/${messageId}`, { method: 'DELETE' })
+  if (!r.ok) throw await readApiError(r)
+}
+
+export async function resendOutboundMessage(sessionId: string, messageId: string): Promise<void> {
+  const r = await fetch(`/sessions/${sessionId}/messages/${messageId}/resend`, { method: 'POST' })
+  if (!r.ok) throw await readApiError(r)
+}
+
 export async function listExecutions(sessionId: string): Promise<Execution[]> {
   const r = await fetch(`/sessions/${sessionId}/executions`)
   if (!r.ok) throw new Error(await r.text())

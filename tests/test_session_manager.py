@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 from claudius.config.schema import WorkflowConfig
+from claudius.controller.attachments import LocalAttachmentStore
 from claudius.controller.backends.base import AbstractBackend
 from claudius.controller.db import Database
 from claudius.controller.session_manager import (
@@ -24,6 +25,7 @@ def _message(thread_id="t1", body="Do a task"):
     return InboundMessage(
         channel="email",
         sender="user@example.com",
+        recipients=["edit@example.com"],
         thread_id=thread_id,
         subject="Hello",
         body=body,
@@ -299,6 +301,7 @@ async def test_initial_prompt_lists_attachment_paths(db, tmp_path):
     await manager.handle_message(InboundMessage(
         channel="email",
         sender="user@example.com",
+        recipients=["edit@example.com"],
         thread_id="thread-attachments",
         subject="Hello",
         body="Review this",
@@ -313,6 +316,36 @@ async def test_initial_prompt_lists_attachment_paths(db, tmp_path):
     assert "- attachments/" in prompt
     assert "- outputs/" in prompt
     assert "/report.pdf" in prompt
+
+
+@pytest.mark.asyncio
+async def test_new_session_persists_channel_metadata(db, tmp_path):
+    backend = _BackendStub()
+    manager = SessionManager(
+        db=db,
+        backend=backend,
+        workflows=[_workflow()],
+        workspaces_path=str(tmp_path / "workspaces"),
+        channels={},
+    )
+    manager._start_log_tailer = lambda *args, **kwargs: None
+
+    await manager.handle_message(InboundMessage(
+        channel="email",
+        sender="user@example.com",
+        recipients=["edit@example.com"],
+        thread_id="thread-meta-new",
+        subject="Theme overhaul",
+        body="Review this",
+        attachments=[],
+        received_at=datetime.now(timezone.utc),
+    ))
+
+    session = await db.get_session_by_thread("thread-meta-new")
+    assert session is not None
+    assert session.channel_metadata["sender"] == "user@example.com"
+    assert session.channel_metadata["recipients"] == ["edit@example.com"]
+    assert session.channel_metadata["subject"] == "Theme overhaul"
 
 
 @pytest.mark.asyncio
@@ -937,6 +970,7 @@ async def test_no_matching_workflow_raises(db, tmp_path):
         await manager.handle_message(InboundMessage(
             channel="whatsapp",
             sender="+1234",
+            recipients=[],
             thread_id="wa-1",
             subject=None,
             body="Hello",
@@ -1205,6 +1239,74 @@ async def test_receive_outbound_stores_message_and_publishes(db, tmp_path):
     assert data["type"] == "message"
     assert data["body"] == "Agent reply"
     assert data["attachments"] == [{"filename": "report.txt", "content_type": "text/plain"}]
+
+
+@pytest.mark.asyncio
+async def test_receive_outbound_delivers_via_session_channel(db, tmp_path):
+    backend = _BackendStub()
+    channel = AsyncMock()
+
+    manager = SessionManager(
+        db=db,
+        backend=backend,
+        workflows=[_workflow()],
+        workspaces_path=str(tmp_path / "workspaces"),
+        channels={"email": channel},
+    )
+    manager._start_log_tailer = lambda *args, **kwargs: None
+    await manager.handle_message(_message(thread_id="t-out-delivery"))
+    session = await db.get_session_by_thread("t-out-delivery")
+
+    attachments = [Attachment(filename="report.txt", content_type="text/plain", data=b"hello")]
+    await manager.receive_outbound(
+        session.session_id,
+        "Agent reply",
+        attachments,
+    )
+
+    channel.send_message.assert_awaited_once()
+    kwargs = channel.send_message.await_args.kwargs
+    assert kwargs["to"] == "user@example.com"
+    assert kwargs["body"] == "Agent reply"
+    assert kwargs["thread_id"] == "t-out-delivery"
+    assert kwargs["attachments"] == attachments
+
+
+@pytest.mark.asyncio
+async def test_resend_outbound_message_delivers_stored_message(db, tmp_path):
+    backend = _BackendStub()
+    channel = AsyncMock()
+
+    manager = SessionManager(
+        db=db,
+        backend=backend,
+        workflows=[_workflow()],
+        workspaces_path=str(tmp_path / "workspaces"),
+        channels={"email": channel},
+    )
+    manager._start_log_tailer = lambda *args, **kwargs: None
+    await manager.handle_message(_message(thread_id="t-out-resend"))
+    session = await db.get_session_by_thread("t-out-resend")
+
+    await manager.receive_outbound(
+        session.session_id,
+        "Agent reply",
+        [Attachment(filename="report.txt", content_type="text/plain", data=b"hello")],
+    )
+
+    messages = await db.list_messages(session.session_id)
+    outbound = next(message for message in messages if message["direction"] == "outbound")
+
+    await manager.resend_outbound_message(session.session_id, outbound["message_id"])
+
+    assert channel.send_message.await_count == 2
+    kwargs = channel.send_message.await_args.kwargs
+    assert kwargs["to"] == "user@example.com"
+    assert kwargs["body"] == "Agent reply"
+    assert kwargs["thread_id"] == "t-out-resend"
+    assert len(kwargs["attachments"]) == 1
+    assert kwargs["attachments"][0].filename == "report.txt"
+    assert kwargs["attachments"][0].data == b"hello"
 
 
 @pytest.mark.asyncio
@@ -1499,6 +1601,98 @@ async def test_agent_fatal_error_sets_session_to_error_on_turn_end(db, tmp_path)
     halted = await db.get_active_execution("sess-fe2")
     assert halted is None
     assert len(backend.create_execution_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_fatal_error_restarts_when_pending_messages_exist(db, tmp_path):
+    backend = _BackendStub()
+    session = Session(
+        session_id="sess-fe-pending",
+        thread_id="thread-fe-pending",
+        channel="email",
+        workflow_name="test-wf",
+        state=SessionState.ACTIVE,
+        workspace_path=str(tmp_path / "workspaces" / "sess-fe-pending"),
+        created_at=datetime.now(timezone.utc),
+        last_message_at=datetime.now(timezone.utc),
+    )
+    await db.create_session(session)
+    await db.create_execution(_execution(session_id="sess-fe-pending"))
+    await db.store_message(
+        "sess-fe-pending",
+        "inbound",
+        "please continue",
+        sender="user@example.com",
+    )
+
+    manager = SessionManager(
+        db=db,
+        backend=backend,
+        workflows=[_workflow()],
+        workspaces_path=str(tmp_path / "workspaces"),
+        channels={},
+    )
+    manager._start_log_tailer = lambda *args, **kwargs: None
+
+    await manager.record_agent_fatal_error(
+        "sess-fe-pending", category="permission_error", reason="No write access."
+    )
+    await manager.append_active_execution_conversation_event(
+        "sess-fe-pending",
+        source="claude",
+        event_type="result",
+        event_subtype="success",
+        payload={"result": "I'm unable to continue."},
+    )
+
+    updated_session = await db.get_session("sess-fe-pending")
+    assert updated_session is not None
+    assert updated_session.state == SessionState.ACTIVE
+    assert updated_session.last_execution_result == "failed"
+    assert len(backend.create_execution_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_pending_message_removes_message_and_attachments(db, tmp_path):
+    backend = _BackendStub()
+    attachment_store_dir = tmp_path / "attachments"
+    attachment_store = LocalAttachmentStore(attachment_store_dir)
+    session = Session(
+        session_id="sess-delete-pending",
+        thread_id="thread-delete-pending",
+        channel="email",
+        workflow_name="test-wf",
+        state=SessionState.ACTIVE,
+        workspace_path=str(tmp_path / "workspaces" / "sess-delete-pending"),
+        created_at=datetime.now(timezone.utc),
+        last_message_at=datetime.now(timezone.utc),
+    )
+    await db.create_session(session)
+    message_id = await db.store_message(
+        "sess-delete-pending",
+        "inbound",
+        "remove me",
+        [{"filename": "a.txt", "content_type": "text/plain"}],
+        sender="user@example.com",
+    )
+    await attachment_store.write("sess-delete-pending/a.txt", b"hello")
+    await db.store_attachment(message_id, "a.txt", "text/plain", "sess-delete-pending/a.txt")
+
+    manager = SessionManager(
+        db=db,
+        backend=backend,
+        workflows=[_workflow()],
+        workspaces_path=str(tmp_path / "workspaces"),
+        channels={},
+        attachment_store=attachment_store,
+        broker=SSEBroker(),
+    )
+
+    await manager.delete_pending_message("sess-delete-pending", message_id)
+
+    messages = await db.list_messages("sess-delete-pending")
+    assert messages == []
+    assert not (attachment_store_dir / "sess-delete-pending" / "a.txt").exists()
 
 
 @pytest.mark.asyncio

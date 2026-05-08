@@ -38,6 +38,7 @@ _BUILTIN_TOOL_NAMES = {
 class RoutingConfig(BaseModel):
     channels: list[str]
     from_: list[str] = Field(default_factory=list, alias="from")
+    to: list[str] = Field(default_factory=list)
     subject_patterns: list[str] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
@@ -251,7 +252,7 @@ class UpstreamLLMConfig(BaseModel):
 
 class ResendProviderConfig(BaseModel):
     api_key_env: str = "RESEND_API_KEY"
-    from_address: str = "claudius@example.com"
+    from_address: str = ""
     webhook_path: str = "/webhook/resend"
 
     @model_validator(mode="after")
@@ -261,8 +262,6 @@ class ResendProviderConfig(BaseModel):
         self.webhook_path = self.webhook_path.strip()
         if not self.api_key_env:
             raise ValueError("providers.resend.api_key_env must not be empty")
-        if not self.from_address:
-            raise ValueError("providers.resend.from_address must not be empty")
         if not self.webhook_path:
             raise ValueError("providers.resend.webhook_path must not be empty")
         if not self.webhook_path.startswith("/"):
@@ -276,10 +275,12 @@ class ProvidersConfig(BaseModel):
 
 class EmailChannelConfig(BaseModel):
     provider: str = "resend"
+    from_address: str = ""
 
     @model_validator(mode="after")
     def validate_provider(self) -> "EmailChannelConfig":
         self.provider = self.provider.strip().lower()
+        self.from_address = self.from_address.strip()
         if self.provider != "resend":
             raise ValueError("channels.email.provider currently only supports 'resend'")
         return self
@@ -314,6 +315,14 @@ class StartupConfig(BaseModel):
         self.host = self.host.strip()
         self.callback_url = self.callback_url.strip()
         self.attachments = self.attachments.strip()
+        if self.channels.email.provider == "resend":
+            self.channels.email.from_address = (
+                self.channels.email.from_address
+                or self.providers.resend.from_address
+                or "claudius@example.com"
+            ).strip()
+            if not self.channels.email.from_address:
+                raise ValueError("channels.email.from_address must not be empty")
         if self.docker_probe_mode not in DOCKER_PROBE_MODES:
             raise ValueError(
                 "docker_probe_mode must be one of "

@@ -6,15 +6,20 @@ from claudius.models import InboundMessage
 
 def _msg(channel="email", sender="user@example.com", subject="Hello", thread_id="t1"):
     return InboundMessage(
-        channel=channel, sender=sender, thread_id=thread_id,
+        channel=channel, sender=sender, recipients=["edit@example.com"], thread_id=thread_id,
         subject=subject, body="body", attachments=[],
         received_at=datetime.now(timezone.utc),
     )
 
-def _workflow(channels=["email"], from_=[], subject_patterns=[], name="wf"):
+def _workflow(channels=["email"], from_=[], to=[], subject_patterns=[], name="wf"):
     return WorkflowConfig.model_validate({
         "name": name,
-        "routing": {"channels": channels, "from": from_, "subject_patterns": subject_patterns},
+        "routing": {
+            "channels": channels,
+            "from": from_,
+            "to": to,
+            "subject_patterns": subject_patterns,
+        },
         "claude": {"system_prompt": "test"},
         "response": {"channel": "email"},
     })
@@ -33,6 +38,39 @@ def test_match_glob_sender():
     wf = _workflow(from_=["*@company.com"])
     assert match_workflow(_msg(sender="alice@company.com"), [wf]) == wf
     assert match_workflow(_msg(sender="alice@other.com"), [wf]) is None
+
+def test_match_exact_recipient():
+    wf = _workflow(to=["edit@example.com"])
+    assert match_workflow(_msg(), [wf]) == wf
+    assert match_workflow(
+        InboundMessage(
+            channel="email",
+            sender="user@example.com",
+            recipients=["other@example.com"],
+            thread_id="t1",
+            subject="Hello",
+            body="body",
+            attachments=[],
+            received_at=datetime.now(timezone.utc),
+        ),
+        [wf],
+    ) is None
+
+def test_match_glob_recipient():
+    wf = _workflow(to=["edit@*.app"])
+    assert match_workflow(
+        InboundMessage(
+            channel="email",
+            sender="user@example.com",
+            recipients=["edit@rosenstein.app"],
+            thread_id="t1",
+            subject="Hello",
+            body="body",
+            attachments=[],
+            received_at=datetime.now(timezone.utc),
+        ),
+        [wf],
+    ) == wf
 
 def test_match_subject_pattern():
     wf = _workflow(subject_patterns=["GitLab:*"])

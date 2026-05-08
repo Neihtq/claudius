@@ -15,6 +15,7 @@ FULL_YAML_DICT = {
     "routing": {
         "channels": ["email"],
         "from": ["user@example.com", "*@company.com"],
+        "to": ["edit@example.com", "support@*.example.com"],
         "subject_patterns": ["GitLab:*"],
     },
     "claude": {
@@ -49,6 +50,7 @@ def test_minimal_workflow_config():
 def test_full_workflow_config():
     wf = WorkflowConfig.model_validate(FULL_YAML_DICT)
     assert wf.routing.from_ == ["user@example.com", "*@company.com"]
+    assert wf.routing.to == ["edit@example.com", "support@*.example.com"]
     assert wf.routing.subject_patterns == ["GitLab:*"]
     assert wf.session.timeout_minutes == 30
     assert len(wf.claude.tools) == 1
@@ -118,6 +120,35 @@ def test_startup_config_defaults_to_anthropic_protocol_with_x_api_key_auth():
     assert cfg.upstream_llm.protocol == "anthropic"
     assert cfg.upstream_llm.auth_mode is None
     assert cfg.image == "claudius:latest"
+    assert cfg.channels.email.from_address == "claudius@example.com"
+
+
+def test_startup_config_prefers_channel_email_from_address():
+    cfg = StartupConfig.model_validate({
+        "channels": {
+            "email": {
+                "provider": "resend",
+                "from_address": "edit@rosenstein.app",
+            }
+        },
+        "providers": {
+            "resend": {
+                "from_address": "legacy@example.com",
+            }
+        },
+    })
+    assert cfg.channels.email.from_address == "edit@rosenstein.app"
+
+
+def test_startup_config_falls_back_to_provider_resend_from_address():
+    cfg = StartupConfig.model_validate({
+        "providers": {
+            "resend": {
+                "from_address": "legacy@example.com",
+            }
+        },
+    })
+    assert cfg.channels.email.from_address == "legacy@example.com"
 
 
 def test_startup_config_rejects_invalid_protocol():

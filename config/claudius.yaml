@@ -9,16 +9,26 @@ callback_url: http://host.docker.internal:8000
 attachments: file:///tmp/claudius-attachments
 log_conversation: false
 
+channels:
+  email:
+    provider: resend
+    from_address: claudius@example.com
+
+providers:
+  resend:
+    api_key_env: RESEND_API_KEY
+    webhook_path: /webhook/resend
+
 # Resend inbound email is webhook-based. In local dev, expose this controller on a
 # public HTTPS URL with a tunnel (for example `cloudflared tunnel --url
 # http://localhost:8000`) and point Resend's email.received webhook at that URL
 # plus /webhook/resend.
 
-# upstream_llm:
-#   protocol: anthropic
-#   base_url: https://openrouter.ai/api
-#   api_key_env: OPENROUTER_API_KEY
-#   auth_mode: bearer
+upstream_llm:
+  protocol: anthropic
+  base_url: https://openrouter.ai/api
+  api_key_env: OPENROUTER_API_KEY
+  auth_mode: bearer
 
 # Anthropic example:
 # upstream_llm:
@@ -35,21 +45,21 @@ log_conversation: false
 #   auth_mode: bearer
 
 # Cerebras example:
-upstream_llm:
-  protocol: openai
-  base_url: https://api.cerebras.ai/v1
-  api_key_env: CEREBRAS_API_KEY
-  auth_mode: bearer
-  model_pricing:
-    zai-glm-4.7:
-      input_cost_per_million_tokens_usd: 2.25
-      output_cost_per_million_tokens_usd: 2.75
-    gpt-oss-120b:
-      input_cost_per_million_tokens_usd: 0.35
-      output_cost_per_million_tokens_usd: 0.75
-    qwen-3-235b-a22b-instruct-2507:
-      input_cost_per_million_tokens_usd: 0.6
-      output_cost_per_million_tokens_usd: 1.2
-    llama3.1-8b:
-      input_cost_per_million_tokens_usd: 0.1
-      output_cost_per_million_tokens_usd: 0.1
+# upstream_llm:
+#   protocol: openai
+#   base_url: https://api.cerebras.ai/v1
+#   api_key_env: CEREBRAS_API_KEY
+#   auth_mode: bearer
+#   model_pricing:
+#     zai-glm-4.7:
+#       input_cost_per_million_tokens_usd: 2.25
+#       output_cost_per_million_tokens_usd: 2.75
+#     gpt-oss-120b:
+#       input_cost_per_million_tokens_usd: 0.35
+#       output_cost_per_million_tokens_usd: 0.75
+#     qwen-3-235b-a22b-instruct-2507:
+#       input_cost_per_million_tokens_usd: 0.6
+#       output_cost_per_million_tokens_usd: 1.2
+#     llama3.1-8b:
+#       input_cost_per_million_tokens_usd: 0.1
+#       output_cost_per_million_tokens_usd: 0.1

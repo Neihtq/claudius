@@ -8,6 +8,7 @@ from claudius.session.runner import SessionRunner
 class MessagePayload(BaseModel):
     channel: str
     sender: str
+    recipients: list[str] = []
     thread_id: str
     subject: str | None
     body: str
@@ -40,6 +41,7 @@ def create_session_app(
         msg = InboundMessage(
             channel=payload.channel,
             sender=payload.sender,
+            recipients=payload.recipients,
             thread_id=payload.thread_id,
             subject=payload.subject,
             body=payload.body,

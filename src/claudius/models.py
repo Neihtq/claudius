@@ -81,6 +81,7 @@ class Attachment:
 class InboundMessage:
     channel: str
     sender: str
+    recipients: list[str]
     thread_id: str
     subject: str | None
     body: str
@@ -100,6 +101,7 @@ class Session:
     last_message_at: datetime
     last_execution_result: str | None = None  # 'ok' | 'failed' | None
     claude_summary: ClaudeSummary | None = None
+    channel_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
