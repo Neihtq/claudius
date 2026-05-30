@@ -18,6 +18,10 @@ at ``localhost:8090``), runs pre-launch hooks in-process, then runs Claude Code.
 import asyncio
 import json
 import os
+import sys
+import threading
+from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +43,73 @@ from claudius.runtime import (
 )
 from claudius.runtime_sidecar import RuntimeSidecar, create_app as create_runtime_app
 from claudius.session.runner import SessionRunner
+
+
+class _LogBuffer:
+    """Bounded, absolutely-indexed ring buffer of (stream, body) log lines.
+
+    The controller polls /status with the last offset it consumed; ``since``
+    returns the new lines plus the new absolute offset. Old lines are dropped past
+    ``maxlen`` (already persisted controller-side), and offsets account for drops.
+    """
+
+    def __init__(self, maxlen: int = 10000):
+        self._lines: deque[tuple[str, str]] = deque(maxlen=maxlen)
+        self._dropped = 0
+        self._lock = threading.Lock()
+
+    def add(self, stream: str, body: str) -> None:
+        with self._lock:
+            if self._lines.maxlen and len(self._lines) == self._lines.maxlen:
+                self._dropped += 1
+            self._lines.append((stream, body))
+
+    def reset(self) -> None:
+        with self._lock:
+            self._lines.clear()
+            self._dropped = 0
+
+    def since(self, offset: int) -> tuple[list[dict[str, str]], int]:
+        with self._lock:
+            total = self._dropped + len(self._lines)
+            start = max(0, offset - self._dropped)
+            chunk = [
+                {"stream": s, "body": b} for (s, b) in list(self._lines)[start:]
+            ]
+            return chunk, total
+
+
+class _Tee:
+    """File-like wrapper that writes through to the original stream and also
+    appends completed lines to a :class:`_LogBuffer`."""
+
+    def __init__(self, original, buffer: _LogBuffer, stream: str):
+        self._original = original
+        self._buffer = buffer
+        self._stream = stream
+        self._partial = ""
+
+    def write(self, text: str) -> int:
+        self._original.write(text)
+        self._partial += text
+        while True:
+            idx = self._partial.find("\n")
+            if idx < 0:
+                break
+            line = self._partial[:idx]
+            self._partial = self._partial[idx + 1 :]
+            if line:
+                self._buffer.add(self._stream, line)
+        return len(text)
+
+    def flush(self) -> None:
+        self._original.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        return self._original.fileno()
 
 
 @dataclass
@@ -146,6 +217,7 @@ def create_pod_app(
     *,
     workspace_path: str,
     configure_token: str = "",
+    log_buffer: _LogBuffer | None = None,
 ) -> FastAPI:
     app = FastAPI()
     state = _PodState()
@@ -190,19 +262,21 @@ def create_pod_app(
             state.state = "running"
             logger.info("session pod execution running execution_id={}", req.execution_id)
             await runner.run()
-            state.state = "finished"
-            state.exit_code = 0
+            # Set terminal state only after logging, so a controller that observes
+            # the terminal state on /status is guaranteed the final logs are buffered.
             logger.info("session pod execution finished execution_id={}", req.execution_id)
+            state.exit_code = 0
+            state.state = "finished"
         except asyncio.CancelledError:
-            state.state = "failed"
-            state.exit_code = 1
             state.detail = "cancelled"
+            state.exit_code = 1
+            state.state = "failed"
             raise
         except Exception as exc:
-            state.state = "failed"
-            state.exit_code = 1
-            state.detail = str(exc)
             logger.exception("session pod execution failed execution_id={} error={}", req.execution_id, exc)
+            state.detail = str(exc)
+            state.exit_code = 1
+            state.state = "failed"
         finally:
             state.runner = None
 
@@ -213,24 +287,50 @@ def create_pod_app(
     @app.post("/configure")
     async def configure(req: ConfigureRequest, authorization: str | None = Header(default=None)):
         _require_token(authorization, configure_token)
+        # The controller is authoritative. If an execution is already running
+        # (e.g. an orphan from a previous controller instance — the controller's DB
+        # is ephemeral), preempt it instead of rejecting, so a freshly-(re)started
+        # controller can always (re)start the loop.
         if state.state in ("starting", "running"):
-            raise HTTPException(status_code=409, detail="session pod is busy")
+            logger.info(
+                "session pod preempting execution {} for new /configure", state.execution_id
+            )
+            runner = state.runner
+            if runner is not None:
+                await runner.graceful_stop()
+            task = state.task
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+        # Start this execution's log stream fresh so the controller's per-execution
+        # log tail (which starts at offset 0) sees only this execution's lines.
+        if log_buffer is not None:
+            log_buffer.reset()
         state.state = "starting"
         state.execution_id = req.execution_id
         state.exit_code = None
         state.detail = ""
+        state.runner = None
         state.task = asyncio.create_task(_run_execution(req))
         return {"status": "accepted", "execution_id": req.execution_id}
 
     @app.get("/status")
-    async def status(authorization: str | None = Header(default=None)):
+    async def status(
+        log_offset: int = 0, authorization: str | None = Header(default=None)
+    ):
         _require_token(authorization, configure_token)
+        logs: list[dict[str, str]] = []
+        next_offset = log_offset
+        if log_buffer is not None:
+            logs, next_offset = log_buffer.since(log_offset)
         return {
             "state": state.state,
             "execution_id": state.execution_id,
             "exit_code": state.exit_code,
             "detail": state.detail,
-            "logs": [],
+            "logs": logs,
+            "log_offset": next_offset,
         }
 
     @app.post("/shutdown")
@@ -256,19 +356,43 @@ def run_session_pod(
     Path(workspace_path).mkdir(parents=True, exist_ok=True)
     configure_token = os.environ.get("CLAUDIUS_CONFIGURE_TOKEN", "").strip()
 
+    # Capture the pod's output so the controller can stream it as execution logs:
+    #  - tee stdout/stderr to catch relayed subprocess output (runtime hooks like
+    #    the workspace clone, and Claude Code's own output), and
+    #  - a loguru sink to catch Claudius's own log lines (lifecycle, failures).
+    log_buffer = _LogBuffer()
+    sys.stdout = _Tee(sys.stdout, log_buffer, "stdout")
+    sys.stderr = _Tee(sys.stderr, log_buffer, "stderr")
+    logger.add(
+        lambda message: log_buffer.add("stderr", message.rstrip("\n")),
+        level="INFO",
+        format="{time:HH:mm:ss} | {level: <7} | {message}",
+        # diagnose=False so exception tracebacks don't dump local variable values
+        # (which can include tokens/secrets) into the streamed logs.
+        backtrace=False,
+        diagnose=False,
+    )
+
     # One shared, initially-empty sidecar object: the worker mutates it on
     # /configure and runs hooks in-process; the :8090 HTTP app serves /invoke for
     # the MCP bridge against the same object.
     sidecar = RuntimeSidecar.empty()
     runtime_app = create_runtime_app(sidecar, startup_phases=[])
-    pod_app = create_pod_app(sidecar, workspace_path=workspace_path, configure_token=configure_token)
+    pod_app = create_pod_app(
+        sidecar,
+        workspace_path=workspace_path,
+        configure_token=configure_token,
+        log_buffer=log_buffer,
+    )
 
     async def _serve() -> None:
         runtime_server = uvicorn.Server(
             uvicorn.Config(runtime_app, host=runtime_host, port=runtime_port, log_level="warning")
         )
+        # log_level="warning" so the controller's ~1s /status polling doesn't spam
+        # access logs (which would feed back into the captured log stream).
         pod_server = uvicorn.Server(
-            uvicorn.Config(pod_app, host=host, port=port, log_level="info")
+            uvicorn.Config(pod_app, host=host, port=port, log_level="warning")
         )
         logger.info(
             "session pod listening worker={}:{} runtime={}:{} workspace={}",

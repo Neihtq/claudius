@@ -186,7 +186,7 @@ class StaticBackend(AbstractBackend):
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     response = await client.get(
                         f"{self._endpoint}/status",
-                        params={"execution_id": execution.execution_id, "log_offset": log_offset},
+                        params={"log_offset": log_offset},
                         headers=self._auth_headers(),
                     )
                 response.raise_for_status()
@@ -201,18 +201,35 @@ class StaticBackend(AbstractBackend):
                 continue
 
             for line in status.get("logs", []) or []:
-                log_offset += 1
-                body = line.get("body", "")
-                stream = line.get("stream", "stdout")
                 yield LogLine(
                     logged_at=datetime.now(timezone.utc),
-                    stream="stderr" if stream == "stderr" else "stdout",
-                    body=f"[worker] {body}",
+                    stream="stderr" if line.get("stream") == "stderr" else "stdout",
+                    body=f"[worker] {line.get('body', '')}",
                 )
+            log_offset = status.get("log_offset", log_offset)
 
             current = status.get("execution_id")
             state = status.get("state")
             if current == execution.execution_id and state in _TERMINAL_STATES:
+                # Final drain: catch any lines emitted between the status read above
+                # and the execution reaching its terminal state.
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        final = (
+                            await client.get(
+                                f"{self._endpoint}/status",
+                                params={"log_offset": log_offset},
+                                headers=self._auth_headers(),
+                            )
+                        ).json()
+                    for line in final.get("logs", []) or []:
+                        yield LogLine(
+                            logged_at=datetime.now(timezone.utc),
+                            stream="stderr" if line.get("stream") == "stderr" else "stdout",
+                            body=f"[worker] {line.get('body', '')}",
+                        )
+                except httpx.HTTPError:
+                    pass
                 self._exit_codes[execution.execution_id] = status.get("exit_code")
                 return
             if current != execution.execution_id and current is not None:
