@@ -85,6 +85,94 @@ def test_get_workflows():
     assert resp.json() == ["wf-a", "wf-b"]
 
 
+def test_ui_admin_auth_blocks_browser_api_without_secret():
+    manager = AsyncMock()
+    app = create_controller_app(
+        session_manager=manager,
+        channels={},
+        broker=SSEBroker(),
+        ui_admin_secret="shared-secret",
+    )
+    client = TestClient(app)
+
+    resp = client.get("/sessions")
+
+    assert resp.status_code == 401
+    manager.list_sessions.assert_not_called()
+
+
+def test_ui_admin_auth_accepts_query_secret_and_sets_cookie():
+    manager = AsyncMock()
+    manager.list_sessions.return_value = []
+    manager.list_workflow_names = MagicMock(return_value=[])
+    app = create_controller_app(
+        session_manager=manager,
+        channels={},
+        broker=SSEBroker(),
+        ui_admin_secret="shared-secret",
+    )
+    client = TestClient(app)
+
+    resp = client.get("/sessions", params={"admin_secret": "shared-secret"})
+    assert resp.status_code == 200
+    assert resp.cookies.get("claudius_ui_admin")
+    assert resp.cookies.get("claudius_ui_admin") != "shared-secret"
+
+    resp = client.get("/workflows")
+    assert resp.status_code == 200
+
+
+def test_ui_admin_auth_rejects_wrong_query_secret():
+    manager = AsyncMock()
+    app = create_controller_app(
+        session_manager=manager,
+        channels={},
+        broker=SSEBroker(),
+        ui_admin_secret="shared-secret",
+    )
+    client = TestClient(app)
+
+    resp = client.get("/sessions", params={"admin_secret": "wrong"})
+
+    assert resp.status_code == 403
+    manager.list_sessions.assert_not_called()
+
+
+def test_ui_admin_auth_does_not_block_session_callbacks():
+    manager = AsyncMock()
+    app = create_controller_app(
+        session_manager=manager,
+        channels={},
+        broker=SSEBroker(),
+        ui_admin_secret="shared-secret",
+    )
+    client = TestClient(app)
+
+    resp = client.post(
+        "/sessions/sess-001/outbound",
+        json={"body": "Agent reply", "attachments": []},
+    )
+
+    assert resp.status_code == 200
+    manager.receive_outbound.assert_called_once()
+
+
+def test_ui_admin_auth_fails_closed_when_configured_empty():
+    manager = AsyncMock()
+    app = create_controller_app(
+        session_manager=manager,
+        channels={},
+        broker=SSEBroker(),
+        ui_admin_secret="",
+    )
+    client = TestClient(app)
+
+    resp = client.get("/sessions")
+
+    assert resp.status_code == 503
+    manager.list_sessions.assert_not_called()
+
+
 def test_get_session_by_id():
     manager = AsyncMock()
     manager.get_session.return_value = _fake_session("sess-001")

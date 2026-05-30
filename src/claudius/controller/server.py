@@ -1,6 +1,9 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -33,6 +36,9 @@ from claudius.models import Attachment, InboundMessage
 
 
 _UI_DIR = Path(__file__).parent.parent.parent.parent / "ui" / "dist"
+_UI_ADMIN_QUERY_PARAM = "admin_secret"
+_UI_ADMIN_COOKIE = "claudius_ui_admin"
+_UI_ADMIN_COOKIE_MAX_AGE = 60 * 60 * 24 * 30
 
 
 class _SPAStaticFiles(StaticFiles):
@@ -105,6 +111,57 @@ def _tokenized_session_path(path: str, session_id: str, proxy_secret: str) -> st
     if not proxy_secret:
         return path
     return f"{path}?token={quote(mint_token(session_id, proxy_secret))}"
+
+
+def _is_ui_protected_path(path: str, method: str) -> bool:
+    method = method.upper()
+    if path == "/ui" or path.startswith("/ui/"):
+        return True
+    if path == "/workflows":
+        return method == "GET"
+    if path == "/dev/inject":
+        return method == "POST"
+    if path.startswith("/executions/"):
+        return method == "GET"
+    if path == "/sessions":
+        return method == "GET"
+    if not path.startswith("/sessions/"):
+        return False
+
+    parts = path.strip("/").split("/")
+    if len(parts) < 2:
+        return False
+    tail = parts[2:]
+    if not tail:
+        return method == "GET"
+    if tail == ["messages"]:
+        return method == "GET"
+    if tail == ["message"]:
+        return method == "POST"
+    if tail == ["events"]:
+        return method == "GET"
+    if tail == ["execution"]:
+        return method == "DELETE"
+    if tail == ["executions"]:
+        return method == "GET"
+    if len(tail) == 2 and tail[0] == "messages":
+        return method == "DELETE"
+    if len(tail) == 3 and tail[0] == "messages" and tail[2] == "resend":
+        return method == "POST"
+    return False
+
+
+def _secure_cookie_for_request(request: Request) -> bool:
+    proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    return proto == "https" or request.url.scheme == "https"
+
+
+def _ui_admin_cookie_value(secret: str) -> str:
+    return hmac.new(
+        secret.encode("utf-8"),
+        b"claudius-ui-admin",
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _serialize_claude_summary(summary) -> dict:
@@ -206,6 +263,7 @@ def create_controller_app(
     proxy_secret: str = "",
     proxy_upstream: ProxyUpstream | None = None,
     attachment_store: AttachmentStore | None = None,
+    ui_admin_secret: str | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -214,6 +272,39 @@ def create_controller_app(
 
     app = FastAPI(lifespan=lifespan)
     inbound_webhooks = inbound_webhooks or {}
+    if ui_admin_secret is None:
+        ui_admin_secret = os.environ.get("CLAUDIUS_UI_ADMIN_SECRET")
+
+    @app.middleware("http")
+    async def _require_ui_admin(request: Request, call_next):
+        if not _is_ui_protected_path(request.url.path, request.method):
+            return await call_next(request)
+        if ui_admin_secret is None:
+            return await call_next(request)
+        if not ui_admin_secret:
+            return Response("UI admin auth is not configured", status_code=503)
+
+        query_secret = request.query_params.get(_UI_ADMIN_QUERY_PARAM, "")
+        cookie_secret = request.cookies.get(_UI_ADMIN_COOKIE, "")
+        expected_cookie = _ui_admin_cookie_value(ui_admin_secret)
+        query_ok = hmac.compare_digest(query_secret, ui_admin_secret)
+        cookie_ok = hmac.compare_digest(cookie_secret, expected_cookie)
+        if not query_ok and not cookie_ok:
+            status = 403 if query_secret else 401
+            return Response("Unauthorized", status_code=status)
+
+        response = await call_next(request)
+        if query_ok:
+            response.set_cookie(
+                _UI_ADMIN_COOKIE,
+                expected_cookie,
+                max_age=_UI_ADMIN_COOKIE_MAX_AGE,
+                httponly=True,
+                secure=_secure_cookie_for_request(request),
+                samesite="lax",
+                path="/",
+            )
+        return response
 
     @app.get("/health")
     async def health():

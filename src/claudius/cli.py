@@ -313,6 +313,7 @@ def serve(
             proxy_secret=proxy_secret,
             proxy_upstream=proxy_upstream,
             attachment_store=attachment_store,
+            ui_admin_secret=os.environ.get("CLAUDIUS_UI_ADMIN_SECRET", ""),
         )
         config = uvicorn.Config(app, host=host, port=port, log_level="info", timeout_graceful_shutdown=3)
         server = uvicorn.Server(config)

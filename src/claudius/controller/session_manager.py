@@ -1763,7 +1763,12 @@ class SessionManager:
             if server.get("name") != "claudius-runtime":
                 continue
             status = server.get("status")
-            if isinstance(status, str) and status.lower() in {"connected", "ready", "ok"}:
+            if isinstance(status, str) and status.lower() in {
+                "connected",
+                "ready",
+                "ok",
+                "pending",
+            }:
                 return None
             return {
                 "name": "claudius-runtime",

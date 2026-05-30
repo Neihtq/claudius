@@ -1510,6 +1510,65 @@ async def test_append_active_execution_conversation_event_fails_fast_on_runtime_
 
 
 @pytest.mark.asyncio
+async def test_append_active_execution_conversation_event_allows_pending_runtime_mcp(
+    db, tmp_path
+):
+    backend = _BackendStub()
+    workflow = WorkflowConfig.model_validate({
+        "name": "runtime-wf",
+        "routing": {"channels": ["email"]},
+        "claude": {"system_prompt": "test"},
+        "runtime": {
+            "tools": [
+                {
+                    "type": "shell",
+                    "name": "git_push",
+                    "description": "Push branch",
+                    "run": "git push origin HEAD",
+                }
+            ]
+        },
+        "response": {"channel": "email"},
+    })
+    manager = SessionManager(
+        db=db,
+        backend=backend,
+        workflows=[workflow],
+        workspaces_path=str(tmp_path / "workspaces"),
+        channels={},
+        broker=SSEBroker(),
+    )
+    manager._start_log_tailer = lambda *args, **kwargs: None
+    await manager.handle_message(_message(thread_id="thread-runtime-pending"))
+    session = await db.get_session_by_thread("thread-runtime-pending")
+
+    await manager.append_active_execution_conversation_event(
+        session.session_id,
+        source="claude",
+        event_type="system",
+        event_subtype="init",
+        payload={
+            "subtype": "init",
+            "session_id": "claude-session-pending",
+            "mcp_servers": [{"name": "claudius-runtime", "status": "pending"}],
+        },
+    )
+
+    assert backend.deleted_executions == []
+    updated_session = await db.get_session(session.session_id)
+    assert updated_session is not None
+    assert updated_session.state == SessionState.ACTIVE
+    execution = await db.get_latest_execution(session.session_id)
+    assert execution is not None
+    assert execution.halt_reason is None
+    events = await db.list_conversation_events(execution.execution_id)
+    assert [item["event_subtype"] for item in events] == [
+        "initial_message",
+        "init",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_list_workflow_names(db, tmp_path):
     backend = _BackendStub()
     manager = SessionManager(

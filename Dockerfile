@@ -11,8 +11,15 @@ RUN apt-get update \
     && rm /tmp/glab.deb \
     && rm -rf /var/lib/apt/lists/*
 
+ARG CLAUDE_CODE_VERSION=2.1.158
+ARG PLAYWRIGHT_MCP_VERSION=0.0.75
+ARG PLAYWRIGHT_VERSION=1.60.0
+
 RUN pip install uv
-RUN npm install -g @anthropic-ai/claude-code @playwright/mcp playwright
+RUN npm install -g \
+    "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" \
+    "playwright@${PLAYWRIGHT_VERSION}"
 RUN playwright install --with-deps chromium
 
 COPY pyproject.toml uv.lock .
