@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { listSessions } from '../api'
 import type { ClaudeSummary, Session } from '../types'
+import ClaudeAuthPanel from './ClaudeAuthPanel'
 import NewSessionModal from './NewSessionModal'
 
 const STATE_COLOR: Record<string, string> = {
@@ -58,6 +59,8 @@ export default function SessionsList() {
             + New Session
           </button>
         </div>
+
+        <ClaudeAuthPanel />
 
         <table className="w-full text-sm">
           <thead>

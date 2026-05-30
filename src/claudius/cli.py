@@ -267,6 +267,33 @@ def serve(
             proxy_secret = secrets.token_hex(32)
         attachment_store = create_store(attachments) if attachments else None
 
+        oauth_manager = None
+        if serve_config.upstream_llm.is_oauth:
+            from claudius.controller.oauth import (
+                InMemoryOAuthTokenStore,
+                OAuthClientConfig,
+                OAuthManager,
+                SqliteOAuthTokenStore,
+            )
+
+            oc = serve_config.upstream_llm.oauth
+            store = SqliteOAuthTokenStore(db) if oc.persist else InMemoryOAuthTokenStore()
+            client_config = OAuthClientConfig(
+                **{
+                    k: v
+                    for k, v in {
+                        "client_id": oc.client_id,
+                        "authorize_url": oc.authorize_url,
+                        "token_url": oc.token_url,
+                        "redirect_uri": oc.redirect_uri,
+                        "scopes": oc.scopes,
+                    }.items()
+                    if v
+                }
+            )
+            oauth_manager = OAuthManager(store=store, config=client_config)
+            await oauth_manager.load()
+
         logger.info("--- Claudius controller starting ---")
         logger.info(f"  db            {db_path}")
         logger.info(
@@ -283,6 +310,13 @@ def serve(
         logger.info(f"  proxy kind    {proxy_upstream.kind}")
         logger.info(f"  proxy target  {proxy_upstream.base_url}")
         logger.info(f"  proxy key env {proxy_upstream_api_key_env or '(none)'}")
+        if oauth_manager is not None:
+            oc = serve_config.upstream_llm.oauth
+            logger.info(
+                f"  llm auth      oauth (Claude subscription; "
+                f"persist={'on' if oc.persist else 'off'}, "
+                f"{'connected' if oauth_manager.is_connected() else 'not connected'})"
+            )
         logger.info(f"  attachments   {attachment_store.describe() if attachment_store else '(none)'}")
         logger.info(f"  email channel {email_channel_config.provider}")
         logger.info(f"  resend key    {resend_provider.api_key_env}")
@@ -303,6 +337,7 @@ def serve(
             log_conversation=log_conversation,
             resend_api_key=resend_api_key,
             resend_from_address=resend_from,
+            oauth_manager=oauth_manager,
         )
         await manager.recover()
         app = create_controller_app(
@@ -314,6 +349,7 @@ def serve(
             proxy_upstream=proxy_upstream,
             attachment_store=attachment_store,
             ui_admin_secret=os.environ.get("CLAUDIUS_UI_ADMIN_SECRET", ""),
+            oauth_manager=oauth_manager,
         )
         config = uvicorn.Config(app, host=host, port=port, log_level="info", timeout_graceful_shutdown=3)
         server = uvicorn.Server(config)

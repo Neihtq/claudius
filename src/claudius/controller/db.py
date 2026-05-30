@@ -101,6 +101,15 @@ CREATE TABLE IF NOT EXISTS attachments (
     content_type  TEXT NOT NULL,
     storage_key   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    provider      TEXT PRIMARY KEY,
+    access_token  TEXT NOT NULL,
+    refresh_token TEXT,
+    expires_at    REAL NOT NULL DEFAULT 0,
+    scope         TEXT NOT NULL DEFAULT '',
+    token_type    TEXT NOT NULL DEFAULT 'Bearer',
+    updated_at    TEXT NOT NULL
+);
 """
 
 
@@ -231,6 +240,14 @@ class Database:
             "event_type TEXT NOT NULL, "
             "event_subtype TEXT, "
             "payload_json TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS oauth_tokens ("
+            "provider TEXT PRIMARY KEY, "
+            "access_token TEXT NOT NULL, "
+            "refresh_token TEXT, "
+            "expires_at REAL NOT NULL DEFAULT 0, "
+            "scope TEXT NOT NULL DEFAULT '', "
+            "token_type TEXT NOT NULL DEFAULT 'Bearer', "
+            "updated_at TEXT NOT NULL);",
         ]:
             try:
                 if migration.startswith("CREATE"):
@@ -244,6 +261,40 @@ class Database:
     async def close(self):
         if self._conn:
             await self._conn.close()
+
+    async def get_oauth_token(self, provider: str) -> dict | None:
+        cursor = await self._conn.execute(
+            "SELECT access_token, refresh_token, expires_at, scope, token_type "
+            "FROM oauth_tokens WHERE provider = ?",
+            (provider,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def set_oauth_token(self, provider: str, creds: dict) -> None:
+        await self._conn.execute(
+            "INSERT INTO oauth_tokens "
+            "(provider, access_token, refresh_token, expires_at, scope, token_type, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(provider) DO UPDATE SET "
+            "access_token=excluded.access_token, refresh_token=excluded.refresh_token, "
+            "expires_at=excluded.expires_at, scope=excluded.scope, "
+            "token_type=excluded.token_type, updated_at=excluded.updated_at",
+            (
+                provider,
+                creds["access_token"],
+                creds.get("refresh_token"),
+                float(creds.get("expires_at") or 0.0),
+                creds.get("scope") or "",
+                creds.get("token_type") or "Bearer",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        await self._conn.commit()
+
+    async def clear_oauth_token(self, provider: str) -> None:
+        await self._conn.execute("DELETE FROM oauth_tokens WHERE provider = ?", (provider,))
+        await self._conn.commit()
 
     async def create_session(self, session: Session) -> None:
         await self._conn.execute(

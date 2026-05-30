@@ -87,6 +87,44 @@ export async function devInject(payload: InjectPayload): Promise<{ session_id: s
   return r.json()
 }
 
+export interface OAuthStatus {
+  connected: boolean
+  expires_at?: number | null
+  expired?: boolean
+  scope?: string
+  can_refresh?: boolean
+}
+
+// Returns null when the OAuth upstream is not enabled (route absent / 404).
+export async function getOauthStatus(): Promise<OAuthStatus | null> {
+  const r = await fetch('/oauth/status')
+  if (r.status === 404) return null
+  if (!r.ok) throw await readApiError(r)
+  return r.json()
+}
+
+export async function startOauth(): Promise<{ authorize_url: string; state: string }> {
+  const r = await fetch('/oauth/start', { method: 'POST' })
+  if (!r.ok) throw await readApiError(r)
+  return r.json()
+}
+
+export async function exchangeOauth(code: string): Promise<OAuthStatus> {
+  const r = await fetch('/oauth/exchange', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  })
+  if (!r.ok) throw await readApiError(r)
+  return r.json()
+}
+
+export async function logoutOauth(): Promise<OAuthStatus> {
+  const r = await fetch('/oauth/logout', { method: 'POST' })
+  if (!r.ok) throw await readApiError(r)
+  return r.json()
+}
+
 export async function sendMessage(
   sessionId: string,
   body: string,

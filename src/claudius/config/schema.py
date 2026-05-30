@@ -17,6 +17,7 @@ UPSTREAM_AUTH_MODES = (
     "x-api-key",
     "bearer",
     "none",
+    "oauth",
 )
 _BUILTIN_TOOL_NAMES = {
     "bash",
@@ -271,12 +272,32 @@ class UpstreamModelPricingConfig(BaseModel):
         return self
 
 
+class OAuthUpstreamConfig(BaseModel):
+    """Settings for the ``oauth`` upstream auth mode (Claude subscription login).
+
+    Defaults target the public Claude Code OAuth client, so a deployment normally
+    only needs ``auth_mode: oauth`` plus optionally ``persist: true``.
+    """
+
+    persist: bool = False
+    client_id: str = ""
+    authorize_url: str = ""
+    token_url: str = ""
+    redirect_uri: str = ""
+    scopes: str = ""
+
+
 class UpstreamLLMConfig(BaseModel):
     protocol: str = "anthropic"
     base_url: str = ""
     api_key_env: str = ""
     auth_mode: str | None = None
     model_pricing: dict[str, UpstreamModelPricingConfig] = Field(default_factory=dict)
+    oauth: OAuthUpstreamConfig = Field(default_factory=OAuthUpstreamConfig)
+
+    @property
+    def is_oauth(self) -> bool:
+        return self.auth_mode == "oauth"
 
     @model_validator(mode="after")
     def validate_upstream(self) -> "UpstreamLLMConfig":
@@ -296,6 +317,8 @@ class UpstreamLLMConfig(BaseModel):
                 "upstream_llm.auth_mode must be one of "
                 + ", ".join(repr(mode) for mode in UPSTREAM_AUTH_MODES)
             )
+        if self.auth_mode == "oauth" and self.protocol != "anthropic":
+            raise ValueError("upstream_llm.auth_mode 'oauth' requires protocol 'anthropic'")
         normalized_model_pricing: dict[str, UpstreamModelPricingConfig] = {}
         for model_name, pricing in self.model_pricing.items():
             normalized_name = model_name.strip()

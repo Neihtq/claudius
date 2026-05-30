@@ -19,6 +19,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from claudius.channels.base import AbstractChannel
 from claudius.controller.attachments import AttachmentStore
+from claudius.controller.oauth import OAuthError, OAuthManager
 from claudius.controller.proxy import (
     ProxyUpstream,
     build_proxy_upstream,
@@ -116,6 +117,8 @@ def _tokenized_session_path(path: str, session_id: str, proxy_secret: str) -> st
 def _is_ui_protected_path(path: str, method: str) -> bool:
     method = method.upper()
     if path == "/ui" or path.startswith("/ui/"):
+        return True
+    if path == "/oauth" or path.startswith("/oauth/"):
         return True
     if path == "/workflows":
         return method == "GET"
@@ -264,6 +267,7 @@ def create_controller_app(
     proxy_upstream: ProxyUpstream | None = None,
     attachment_store: AttachmentStore | None = None,
     ui_admin_secret: str | None = None,
+    oauth_manager: "OAuthManager | None" = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -606,6 +610,32 @@ def create_controller_app(
         except Exception:
             raise HTTPException(status_code=404, detail="Attachment data not found in store")
         return Response(content=data, media_type=att["content_type"])
+
+    if oauth_manager is not None:
+        class _OAuthCodeBody(BaseModel):
+            code: str
+
+        @app.get("/oauth/status")
+        async def oauth_status():
+            return oauth_manager.status()
+
+        @app.post("/oauth/start")
+        async def oauth_start():
+            # Returns the authorize URL the operator must visit. The redirect URI of
+            # the public Claude client displays a `code#state` value to paste back.
+            return oauth_manager.start_login()
+
+        @app.post("/oauth/exchange")
+        async def oauth_exchange(body: _OAuthCodeBody):
+            try:
+                return await oauth_manager.complete_login(body.code)
+            except OAuthError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+
+        @app.post("/oauth/logout")
+        async def oauth_logout():
+            await oauth_manager.logout()
+            return oauth_manager.status()
 
     @app.get("/")
     async def root_redirect():

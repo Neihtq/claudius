@@ -1204,6 +1204,53 @@ async def test_worker_env_uses_configured_resend_values(db, tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_worker_env_uses_oauth_token_when_connected(db, tmp_path, monkeypatch):
+    import time
+
+    from claudius.controller.oauth import (
+        InMemoryOAuthTokenStore,
+        OAuthCredentials,
+        OAuthManager,
+    )
+
+    backend = _BackendStub()
+    monkeypatch.setenv("RESEND_API_KEY", "resend-key")
+
+    oauth = OAuthManager(store=InMemoryOAuthTokenStore())
+    await oauth._set(
+        OAuthCredentials(
+            access_token="oauth-access-token",
+            refresh_token="refresh",
+            expires_at=time.time() + 3600,
+            scope="user:inference",
+        )
+    )
+
+    manager = SessionManager(
+        db=db,
+        backend=backend,
+        workflows=[_workflow()],
+        workspaces_path=str(tmp_path / "workspaces"),
+        channels={},
+        callback_url="http://controller",
+        proxy_secret="secret-123",
+        oauth_manager=oauth,
+    )
+    manager._start_log_tailer = lambda *args, **kwargs: None
+
+    await manager.handle_message(_message(thread_id="oauth-thread"))
+
+    extra_env = backend.create_execution_calls[0][3]
+    # OAuth takes precedence and bypasses the proxy: Claude Code talks directly to
+    # api.anthropic.com via CLAUDE_CODE_OAUTH_TOKEN.
+    assert extra_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-access-token"
+    assert "ANTHROPIC_API_KEY" not in extra_env
+    assert "ANTHROPIC_BASE_URL" not in extra_env
+    # Runtime-tool callback auth is unaffected.
+    assert extra_env["CLAUDIUS_SESSION_TOKEN"]
+
+
+@pytest.mark.asyncio
 async def test_receive_outbound_stores_message_and_publishes(db, tmp_path):
     backend = _BackendStub()
     broker = SSEBroker()

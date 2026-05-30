@@ -15,6 +15,7 @@ from claudius.config.schema import WorkflowConfig
 from claudius.controller.attachments import AttachmentStore
 from claudius.controller.backends.base import AbstractBackend, ExecutionStartupError
 from claudius.controller.db import Database
+from claudius.controller.oauth import OAuthManager
 from claudius.controller.proxy import mint_token
 from claudius.controller.router import match_workflow
 from claudius.controller.sse import SSEBroker
@@ -102,6 +103,7 @@ class SessionManager:
         secret_provider: SecretProvider | None = None,
         resend_api_key: str = "",
         resend_from_address: str = "claudius@example.com",
+        oauth_manager: "OAuthManager | None" = None,
     ):
         self._db = db
         self._backend = backend
@@ -116,6 +118,7 @@ class SessionManager:
         self._secret_provider = secret_provider or EnvironmentSecretProvider()
         self._resend_api_key = resend_api_key
         self._resend_from_address = resend_from_address
+        self._oauth_manager = oauth_manager
         self._tail_tasks: dict[str, asyncio.Task] = {}
         self._idle_stop_tasks: dict[str, asyncio.Task] = {}
         self._interrupt_after_turn: dict[str, str] = {}
@@ -1032,6 +1035,8 @@ class SessionManager:
                 message_id=message_id,
                 attachments=attachments,
             )
+            if self._oauth_manager:
+                await self._oauth_manager.ensure_fresh()
             extra_env = self._build_worker_env(
                 workflow,
                 message,
@@ -1150,6 +1155,8 @@ class SessionManager:
             output_message_id = pending[-1]["message_id"]
             self._ensure_output_dir(workspace.path, output_message_id)
             conversation_text = await self._build_resume_prompt(pending)
+            if self._oauth_manager:
+                await self._oauth_manager.ensure_fresh()
             extra_env = self._build_worker_env(
                 workflow,
                 initial_msg,
@@ -1265,11 +1272,23 @@ class SessionManager:
             env["CLAUDIUS_OUTPUT_DIR"] = f"/workspace/outputs/{output_message_id}"
         if claude_resume_session_id:
             env["CLAUDIUS_CLAUDE_RESUME_SESSION_ID"] = claude_resume_session_id
+        # Session callback token: lets runtime tools authenticate back to the
+        # controller. Independent of how the LLM itself is authenticated, so we mint
+        # it even in OAuth mode.
+        session_token = ""
         if self._callback_url and self._proxy_secret:
             session_token = mint_token(session_id, self._proxy_secret)
+            env["CLAUDIUS_SESSION_TOKEN"] = session_token
+
+        # LLM authentication. A connected Claude OAuth credential takes precedence and
+        # makes Claude Code talk directly to api.anthropic.com (bypassing the proxy;
+        # see controller/oauth.py). Otherwise use the proxy, then a passthrough key.
+        oauth_token = self._oauth_manager.access_token() if self._oauth_manager else None
+        if oauth_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+        elif session_token:
             env["ANTHROPIC_API_KEY"] = session_token
             env["ANTHROPIC_BASE_URL"] = f"{self._callback_url.rstrip('/')}/proxy"
-            env["CLAUDIUS_SESSION_TOKEN"] = session_token
         else:
             for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"):
                 if value := os.environ.get(key):
