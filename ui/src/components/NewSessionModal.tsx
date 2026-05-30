@@ -22,6 +22,7 @@ export default function NewSessionModal({ onClose }: Props) {
   const [workflow, setWorkflow] = useState('')
   const [channel, setChannel] = useState('email')
   const [sender, setSender] = useState('dev@localhost')
+  const [recipient, setRecipient] = useState('edit@example.com')
   const [subject, setSubject] = useState('')
   const [phone, setPhone] = useState('')
   const [body, setBody] = useState('')
@@ -57,6 +58,7 @@ export default function NewSessionModal({ onClose }: Props) {
       const { session_id } = await devInject({
         channel,
         sender: channel === 'whatsapp' ? phone : sender,
+        recipients: channel === 'email' && recipient.trim() ? [recipient.trim()] : [],
         subject: channel === 'email' ? subject : undefined,
         body,
         attachments,
@@ -108,12 +110,20 @@ export default function NewSessionModal({ onClose }: Props) {
         </div>
 
         {channel === 'email' && (
-          <div className="grid grid-cols-2 gap-3 mb-3">
+          <div className="grid grid-cols-1 gap-3 mb-3 sm:grid-cols-3">
             <label className="block">
-              <span className="text-gray-500 text-xs uppercase tracking-wide">From</span>
+              <span className="text-gray-500 text-xs uppercase tracking-wide">Sender</span>
               <input
                 value={sender}
                 onChange={(e) => setSender(e.target.value)}
+                className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200"
+              />
+            </label>
+            <label className="block">
+              <span className="text-gray-500 text-xs uppercase tracking-wide">Recipient</span>
+              <input
+                value={recipient}
+                onChange={(e) => setRecipient(e.target.value)}
                 className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200"
               />
             </label>

@@ -1,12 +1,21 @@
 [tools]
 cloudflared = "latest"
+node = "latest"
+"npm:typescript" = "latest"
 uv = "latest"
 
 [tasks."docker:build"]
 run = "docker build -t claudius:latest ."
 
+[tasks."ui:install"]
+dir = "ui"
+run = "npm ci"
+sources = ["ui/package.json", "ui/package-lock.json"]
+outputs = ["node_modules/.package-lock.json"]
+
 [tasks."ui:build"]
 dir = "ui"
+depends = ["ui:install"]
 run = "npm run build"
 
 [tasks.dev]

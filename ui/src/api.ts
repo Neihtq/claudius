@@ -71,6 +71,7 @@ export async function getMessages(id: string): Promise<Message[]> {
 export interface InjectPayload {
   channel: string
   sender: string
+  recipients?: string[]
   subject?: string
   body: string
   attachments: Attachment[]

@@ -68,6 +68,7 @@ class _ConversationEventRequest(BaseModel):
 class _DevInjectRequest(BaseModel):
     channel: str
     sender: str
+    recipients: list[str] = []
     subject: str | None = None
     body: str
     attachments: list[dict] = []
@@ -424,7 +425,7 @@ def create_controller_app(
         message = InboundMessage(
             channel=req.channel,
             sender=req.sender,
-            recipients=[],
+            recipients=req.recipients,
             thread_id=thread_id,
             subject=req.subject,
             body=req.body,
