@@ -1251,6 +1251,40 @@ async def test_worker_env_uses_oauth_token_when_connected(db, tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_worker_env_oauth_not_connected_does_not_use_proxy(db, tmp_path, monkeypatch):
+    from claudius.controller.oauth import InMemoryOAuthTokenStore, OAuthManager
+
+    backend = _BackendStub()
+    monkeypatch.setenv("RESEND_API_KEY", "resend-key")
+
+    # OAuth mode enabled but no operator has logged in yet.
+    oauth = OAuthManager(store=InMemoryOAuthTokenStore())
+
+    manager = SessionManager(
+        db=db,
+        backend=backend,
+        workflows=[_workflow()],
+        workspaces_path=str(tmp_path / "workspaces"),
+        channels={},
+        callback_url="http://controller",
+        proxy_secret="secret-123",
+        oauth_manager=oauth,
+    )
+    manager._start_log_tailer = lambda *args, **kwargs: None
+
+    await manager.handle_message(_message(thread_id="oauth-unconnected-thread"))
+
+    extra_env = backend.create_execution_calls[0][3]
+    # Must NOT fall back to the proxy (its upstream isn't wired for oauth) and must
+    # not inject a token that doesn't exist yet.
+    assert "ANTHROPIC_BASE_URL" not in extra_env
+    assert "ANTHROPIC_API_KEY" not in extra_env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in extra_env
+    # Callback auth token is still minted.
+    assert extra_env["CLAUDIUS_SESSION_TOKEN"]
+
+
+@pytest.mark.asyncio
 async def test_receive_outbound_stores_message_and_publishes(db, tmp_path):
     backend = _BackendStub()
     broker = SSEBroker()

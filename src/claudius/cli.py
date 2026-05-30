@@ -223,11 +223,15 @@ def serve(
     proxy_upstream_url = serve_config.upstream_llm.base_url
     proxy_upstream_api_key_env = serve_config.upstream_llm.api_key_env
     upstream_api_key = os.environ.get(proxy_upstream_api_key_env, "") if proxy_upstream_api_key_env else ""
+    # In OAuth mode the proxy is unused (sessions talk directly to Anthropic), but a
+    # /proxy route is still registered. "oauth" isn't a valid header-auth mode, so fall
+    # back to a benign "none" upstream that won't raise if the route is ever hit.
+    proxy_auth_mode = "none" if serve_config.upstream_llm.is_oauth else serve_config.upstream_llm.auth_mode
     proxy_upstream = build_proxy_upstream(
         kind=proxy_upstream_kind,
         base_url=proxy_upstream_url,
         api_key=upstream_api_key,
-        auth_mode=serve_config.upstream_llm.auth_mode,
+        auth_mode=proxy_auth_mode,
         model_pricing={
             model_name: pricing.model_dump()
             for model_name, pricing in serve_config.upstream_llm.model_pricing.items()

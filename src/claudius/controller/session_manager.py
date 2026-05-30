@@ -1280,12 +1280,15 @@ class SessionManager:
             session_token = mint_token(session_id, self._proxy_secret)
             env["CLAUDIUS_SESSION_TOKEN"] = session_token
 
-        # LLM authentication. A connected Claude OAuth credential takes precedence and
-        # makes Claude Code talk directly to api.anthropic.com (bypassing the proxy;
-        # see controller/oauth.py). Otherwise use the proxy, then a passthrough key.
-        oauth_token = self._oauth_manager.access_token() if self._oauth_manager else None
-        if oauth_token:
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+        # LLM authentication. In OAuth upstream mode Claude Code talks directly to
+        # api.anthropic.com and the proxy is bypassed entirely — so we never fall back
+        # to it. Until an operator logs in there is simply no token to inject; the
+        # session then fails to authenticate, which is the intended signal to log in.
+        # Otherwise use the proxy, then a passthrough key from the controller env.
+        if self._oauth_manager is not None:
+            oauth_token = self._oauth_manager.access_token()
+            if oauth_token:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
         elif session_token:
             env["ANTHROPIC_API_KEY"] = session_token
             env["ANTHROPIC_BASE_URL"] = f"{self._callback_url.rstrip('/')}/proxy"
