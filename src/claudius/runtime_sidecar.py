@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import secrets
 import shlex
 import sys
 from contextlib import asynccontextmanager
@@ -25,6 +26,10 @@ class RuntimeSidecar:
     @classmethod
     def from_env(cls) -> "RuntimeSidecar":
         payload = json.loads(os.environ["CLAUDIUS_RUNTIME_SPEC_JSON"])
+        return cls.from_payload(payload)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "RuntimeSidecar":
         tools = {tool["name"]: tool for tool in payload.get("tools", [])}
         return cls(
             auth_token=payload["auth_token"],
@@ -32,6 +37,22 @@ class RuntimeSidecar:
             hooks=payload.get("hooks", []),
             tools=tools,
         )
+
+    @classmethod
+    def empty(cls) -> "RuntimeSidecar":
+        """A sidecar with no tools/hooks, used as a placeholder until configured.
+
+        Static (pre-created) deployments start the sidecar before any execution
+        exists; the spec is supplied later via :meth:`configure`.
+        """
+        return cls(auth_token=secrets.token_hex(16), context_env={}, hooks=[], tools={})
+
+    def configure(self, payload: dict[str, Any]) -> None:
+        """Replace this sidecar's spec in place (auth token, context, hooks, tools)."""
+        self.auth_token = payload["auth_token"]
+        self.context_env = payload.get("context_env", {})
+        self.hooks = payload.get("hooks", [])
+        self.tools = {tool["name"]: tool for tool in payload.get("tools", [])}
 
     async def run_hooks(self, phases: list[str]) -> None:
         logger.info("running runtime hook phases={}", phases)

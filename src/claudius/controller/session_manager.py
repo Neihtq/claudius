@@ -36,6 +36,7 @@ from claudius.runtime import (
     build_runtime_sidecar_payload,
     new_runtime_auth_token,
     resolve_runtime,
+    write_external_mcp_config,
     write_runtime_bridge_files,
 )
 from claudius.session.workspace import Workspace
@@ -73,6 +74,9 @@ _RUNTIME_MCP_FAILURE_ERROR = (
 _GRACEFUL_STOP_TIMEOUT_SECONDS = 10.0
 _FORCED_STOP_TAIL_DRAIN_SECONDS = 1.0
 _WORKER_STOP_HTTP_TIMEOUT_SECONDS = 2.0
+# Perpetual workflows auto-restart their loop after an execution ends, but only
+# if the execution ran at least this long — guarding against crash-loop spin.
+_PERPETUAL_MIN_RUNTIME_SECONDS = 30.0
 
 
 @dataclass
@@ -324,6 +328,9 @@ class SessionManager:
                     })
             return
 
+        await self._maybe_enqueue_perpetual_continuation(
+            execution.session_id, refreshed_execution, last_result
+        )
         await self._resume_or_transition(execution.session_id, SessionState.HIBERNATED)
 
     # -------------------------------------------------------------------------
@@ -1032,7 +1039,7 @@ class SessionManager:
                 conversation_text=initial_prompt,
                 output_message_id=message_id,
             )
-            tool_mounts = self._build_runtime_tool_mounts(
+            tool_mounts = self._build_runtime_tool_mounts_for_backend(
                 workflow,
                 message,
                 session_id,
@@ -1151,7 +1158,7 @@ class SessionManager:
                 claude_resume_session_id=resume_claude_session_id,
                 output_message_id=output_message_id,
             )
-            tool_mounts = self._build_runtime_tool_mounts(
+            tool_mounts = self._build_runtime_tool_mounts_for_backend(
                 workflow,
                 initial_msg,
                 session.session_id,
@@ -1273,6 +1280,36 @@ class SessionManager:
             env["CLAUDIUS_LOG_CONVERSATION"] = "1"
         return env
 
+    def _build_runtime_tool_mounts_for_backend(
+        self,
+        workflow: WorkflowConfig,
+        message: InboundMessage,
+        session_id: str,
+        workspace_path: str,
+        *,
+        hook_phases: list[str],
+        worker_env: dict[str, str],
+    ) -> list[ToolMount]:
+        """Resolve runtime tool mounts when the controller owns runtime preparation.
+
+        For backends that drive a pre-created worker without a shared filesystem
+        (e.g. StaticBackend), the worker resolves its own runtime and writes the
+        MCP bridge files locally. In that case we only forward which hook phases
+        the worker should run, and return no tool mounts.
+        """
+        if not self._backend.prepares_runtime_in_controller():
+            if workflow.runtime.pre_launch or workflow.runtime.tools or workflow.mcp_servers:
+                worker_env["CLAUDIUS_RUNTIME_HOOK_PHASES"] = json.dumps(hook_phases)
+            return []
+        return self._build_runtime_tool_mounts(
+            workflow,
+            message,
+            session_id,
+            workspace_path,
+            hook_phases=hook_phases,
+            worker_env=worker_env,
+        )
+
     def _build_runtime_tool_mounts(
         self,
         workflow: WorkflowConfig,
@@ -1292,7 +1329,10 @@ class SessionManager:
             ),
             secret_provider=self._secret_provider,
         )
-        if not runtime.has_tools() and not runtime.has_hooks():
+        extra_mcp_servers = {
+            name: server.to_claude_config() for name, server in workflow.mcp_servers.items()
+        }
+        if not runtime.has_tools() and not runtime.has_hooks() and not extra_mcp_servers:
             return []
 
         mount = ToolMount()
@@ -1319,8 +1359,14 @@ class SessionManager:
                 callback_url=self._callback_url or "",
                 callback_token=callback_token,
                 session_id=session_id,
+                extra_mcp_servers=extra_mcp_servers,
             )
             worker_env["CLAUDIUS_MCP_CONFIG"] = f"/workspace/.claudius-runtime/{mcp_config_path.name}"
+        elif extra_mcp_servers:
+            mcp_config_path = write_external_mcp_config(workspace_path, extra_mcp_servers)
+            worker_env["CLAUDIUS_MCP_CONFIG"] = f"/workspace/.claudius-runtime/{mcp_config_path.name}"
+            if not runtime.has_hooks():
+                return []
         if runtime.has_hooks() or runtime.has_tools():
             mount.sidecars.append({
                 "name": sidecar_name,
@@ -1437,6 +1483,49 @@ class SessionManager:
             },
         )
         await self._publish_conversation_event(session_id, event)
+
+    async def _maybe_enqueue_perpetual_continuation(
+        self,
+        session_id: str,
+        execution: Execution,
+        last_result: str,
+    ) -> None:
+        """For perpetual workflows, queue a synthetic continuation so the loop
+        restarts via the normal resume path.
+
+        This is a safety net: perpetual agents are expected to loop within a
+        single long-running execution. If that execution ever ends, we re-arm the
+        loop — but only when it ran long enough, so a crashing execution does not
+        spin. Failed runs are never auto-restarted.
+        """
+        session = await self._db.get_session(session_id)
+        if session is None:
+            return
+        workflow = next((w for w in self._workflows if w.name == session.workflow_name), None)
+        if workflow is None or not workflow.session.perpetual:
+            return
+        if last_result != "ok":
+            return
+        ran_seconds = 0.0
+        if execution.halted_at is not None:
+            ran_seconds = (execution.halted_at - execution.started_at).total_seconds()
+        if ran_seconds < _PERPETUAL_MIN_RUNTIME_SECONDS:
+            logger.warning(
+                "skipping perpetual restart (ran {:.0f}s < {:.0f}s) session_id={}",
+                ran_seconds,
+                _PERPETUAL_MIN_RUNTIME_SECONDS,
+                session_id,
+            )
+            return
+        if await self._db.get_pending_inbound_messages(session_id):
+            return
+        logger.info("perpetual restart: enqueuing continuation session_id={}", session_id)
+        await self._store_inbound_message(
+            session_id,
+            "Continue the loop.",
+            [],
+            sender="perpetual@claudius",
+        )
 
     async def _resume_or_transition(
         self,

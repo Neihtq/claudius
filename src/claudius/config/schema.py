@@ -51,6 +51,47 @@ class ClaudeConfig(BaseModel):
     supports_images: bool = True
 
 
+class McpServerConfig(BaseModel):
+    """Declaration of an external MCP server to expose to Claude Code.
+
+    Rendered into Claude Code's ``--mcp-config`` JSON alongside the built-in
+    ``claudius-runtime`` bridge. ``stdio`` servers require ``command``; ``http``
+    and ``sse`` servers require ``url``.
+    """
+
+    type: str = "stdio"
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    url: str = ""
+
+    @model_validator(mode="after")
+    def validate_mcp_server(self) -> "McpServerConfig":
+        self.type = self.type.strip().lower()
+        if self.type not in {"stdio", "http", "sse"}:
+            raise ValueError("mcp_servers type must be one of 'stdio', 'http', 'sse'")
+        if self.type == "stdio":
+            if not self.command.strip():
+                raise ValueError("mcp_servers stdio entries require a non-empty 'command'")
+        else:
+            if not self.url.strip():
+                raise ValueError("mcp_servers http/sse entries require a non-empty 'url'")
+        return self
+
+    def to_claude_config(self) -> dict:
+        if self.type == "stdio":
+            entry: dict = {"type": "stdio", "command": self.command}
+            if self.args:
+                entry["args"] = list(self.args)
+            if self.env:
+                entry["env"] = dict(self.env)
+            return entry
+        entry = {"type": self.type, "url": self.url}
+        if self.env:
+            entry["env"] = dict(self.env)
+        return entry
+
+
 class RuntimeHookConfig(BaseModel):
     type: str = "shell"
     when: str
@@ -172,6 +213,11 @@ class SessionConfig(BaseModel):
     max_messages: int = 50
     idle_timeout_seconds: int = 60
     active_followup_policy: str = "interrupt_after_turn"
+    perpetual: bool = False
+    # Auto-start one session for this workflow when the controller boots (if none
+    # already exists). Useful for always-on agents that aren't message-driven.
+    autostart: bool = False
+    autostart_prompt: str = "Begin."
 
     @model_validator(mode="after")
     def validate_active_followup_policy(self) -> "SessionConfig":
@@ -196,6 +242,16 @@ class WorkflowConfig(BaseModel):
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     response: ResponseConfig = Field(default_factory=ResponseConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
+    mcp_servers: dict[str, McpServerConfig] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_workflow(self) -> "WorkflowConfig":
+        for name in self.mcp_servers:
+            if name == "claudius-runtime":
+                raise ValueError("mcp_servers name 'claudius-runtime' is reserved")
+            if not _TOOL_NAME_RE.match(name):
+                raise ValueError(f"invalid mcp_servers name: {name}")
+        return self
 
 
 class UpstreamModelPricingConfig(BaseModel):
@@ -295,6 +351,8 @@ class StartupConfig(BaseModel):
     db_path: str = "claudius.db"
     workspaces_path: str = "/workspaces"
     image: str = "claudius:latest"
+    backend: str = "docker"
+    session_endpoint: str = ""
     docker_probe_mode: str = "host_port"
     host: str = "0.0.0.0"
     port: int = 8000
@@ -311,6 +369,10 @@ class StartupConfig(BaseModel):
         self.db_path = self.db_path.strip()
         self.workspaces_path = self.workspaces_path.strip()
         self.image = self.image.strip()
+        self.backend = self.backend.strip().lower()
+        self.session_endpoint = self.session_endpoint.strip()
+        if self.backend not in {"docker", "static"}:
+            raise ValueError("backend must be one of 'docker', 'static'")
         self.docker_probe_mode = self.docker_probe_mode.strip().lower()
         self.host = self.host.strip()
         self.callback_url = self.callback_url.strip()

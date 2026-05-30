@@ -13,6 +13,17 @@ class ExecutionStartupError(RuntimeError):
 
 
 class AbstractBackend(ABC):
+    def prepares_runtime_in_controller(self) -> bool:
+        """Whether the controller resolves runtime tools/hooks and writes the MCP
+        bridge files before launching the worker.
+
+        Docker-style backends share the workspace volume with the worker, so the
+        controller prepares the runtime. Backends that drive a pre-created,
+        separately-scheduled worker (no shared filesystem) return False; the worker
+        resolves its own runtime and writes its bridge files locally instead.
+        """
+        return True
+
     @abstractmethod
     async def create_execution(
         self,

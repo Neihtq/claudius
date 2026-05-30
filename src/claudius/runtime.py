@@ -194,6 +194,7 @@ def write_runtime_bridge_files(
     callback_url: str = "",
     callback_token: str = "",
     session_id: str = "",
+    extra_mcp_servers: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[Path, Path]:
     runtime_dir = Path(workspace_path) / ".claudius-runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -214,25 +215,35 @@ def write_runtime_bridge_files(
             indent=2,
         )
     )
-    mcp_config_path.write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "claudius-runtime": {
-                        "type": "stdio",
-                        "command": "claudius",
-                        "args": [
-                            "runtime-mcp-bridge",
-                            "--spec",
-                            str(container_runtime_dir / bridge_spec_path.name),
-                        ],
-                    }
-                }
-            },
-            indent=2,
-        )
-    )
+    mcp_servers: dict[str, Any] = {
+        "claudius-runtime": {
+            "type": "stdio",
+            "command": "claudius",
+            "args": [
+                "runtime-mcp-bridge",
+                "--spec",
+                str(container_runtime_dir / bridge_spec_path.name),
+            ],
+        }
+    }
+    mcp_servers.update(extra_mcp_servers or {})
+    mcp_config_path.write_text(json.dumps({"mcpServers": mcp_servers}, indent=2))
     return bridge_spec_path, mcp_config_path
+
+
+def write_external_mcp_config(
+    workspace_path: str | Path,
+    mcp_servers: dict[str, dict[str, Any]],
+) -> Path:
+    """Write an MCP config containing only externally-declared servers.
+
+    Used when a workflow declares ``mcp_servers`` but has no runtime tools (so no
+    ``claudius-runtime`` bridge is needed)."""
+    runtime_dir = Path(workspace_path) / ".claudius-runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    mcp_config_path = runtime_dir / "mcp.json"
+    mcp_config_path.write_text(json.dumps({"mcpServers": dict(mcp_servers)}, indent=2))
+    return mcp_config_path
 
 
 def new_runtime_auth_token() -> str:

@@ -22,5 +22,13 @@ RUN UV_LINK_MODE=copy uv sync --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-ENTRYPOINT ["claudius"]
+# Build the web UI so the controller can serve it at /ui (server.py mounts
+# /app/ui/dist when present).
+COPY ui/ ui/
+RUN npm --prefix ui ci && npm --prefix ui run build
+
+COPY docker/entrypoint.sh /usr/local/bin/claudius-entrypoint
+RUN chmod +x /usr/local/bin/claudius-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/claudius-entrypoint"]
 CMD ["serve"]

@@ -2,7 +2,8 @@ import asyncio
 import json
 import os
 import secrets
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -42,12 +43,75 @@ def cli():
     """Claudius — message-driven agentic platform."""
 
 
+async def _autostart_sessions(manager, workflows, backend) -> None:
+    """Seed one session per autostart workflow on boot, if none exists yet.
+
+    For always-on agents (e.g. a Twitch live-coding loop) that aren't driven by
+    inbound messages, this removes the need to manually POST /dev/inject after a
+    controller (re)start. Failed sessions are not re-seeded automatically — that's
+    left to the perpetual-restart guard or a manual inject — to avoid crash loops.
+    """
+    from claudius.models import InboundMessage, SessionState
+
+    autostart = [w for w in workflows if w.session.autostart]
+    if not autostart:
+        return
+
+    # For a static backend, wait for the pre-created session pod to be reachable
+    # so the first /configure doesn't race the pod's boot.
+    wait_ready = getattr(backend, "wait_until_ready", None)
+    if wait_ready is not None:
+        await wait_ready()
+
+    for wf in autostart:
+        try:
+            sessions = await manager.list_sessions()
+        except Exception as exc:
+            logger.warning("autostart: failed to list sessions: {}", exc)
+            return
+        if any(
+            s.workflow_name == wf.name and s.state != SessionState.CLOSED
+            for s in sessions
+        ):
+            logger.info("autostart: workflow {} already has a session; skipping", wf.name)
+            continue
+        channel = wf.routing.channels[0] if wf.routing.channels else "dev"
+        message = InboundMessage(
+            channel=channel,
+            sender="autostart@claudius",
+            recipients=[],
+            thread_id=str(uuid.uuid4()),
+            subject=None,
+            body=wf.session.autostart_prompt,
+            attachments=[],
+            received_at=datetime.now(timezone.utc),
+        )
+        logger.info("autostart: seeding session for workflow {} on channel {}", wf.name, channel)
+        try:
+            await manager.handle_message(message)
+        except Exception as exc:
+            logger.warning("autostart: failed to seed workflow {}: {}", wf.name, exc)
+
+
 @cli.command()
 @click.pass_context
 @click.option("--config-dir", default="config/workflows", show_default=True)
 @click.option("--db-path", default="claudius.db", show_default=True)
 @click.option("--workspaces-path", default="/workspaces", show_default=True)
 @click.option("--image", default="claudius:latest", show_default=True)
+@click.option(
+    "--backend",
+    type=click.Choice(["docker", "static"], case_sensitive=False),
+    default="docker",
+    show_default=True,
+    help="Execution backend: 'docker' spawns containers; 'static' drives a pre-created session pod.",
+)
+@click.option(
+    "--session-endpoint",
+    default="",
+    help="Static backend: base URL of the pre-created session pod (defaults to "
+    "$CLAUDIUS_SESSION_ENDPOINT or $RISE_CONTAINER_HOST__SESSION).",
+)
 @click.option(
     "--docker-probe-mode",
     type=click.Choice(["host_port", "container_ip"], case_sensitive=False),
@@ -86,6 +150,8 @@ def serve(
     db_path,
     workspaces_path,
     image,
+    backend,
+    session_endpoint,
     docker_probe_mode,
     host,
     port,
@@ -104,7 +170,6 @@ def serve(
         resolve_startup_config,
     )
     from claudius.controller.attachments import create_store
-    from claudius.controller.backends.docker import DockerBackend
     from claudius.controller.db import Database
     from claudius.controller.server import create_controller_app
     from claudius.controller.session_manager import SessionManager
@@ -119,6 +184,8 @@ def serve(
             "db_path": db_path,
             "workspaces_path": workspaces_path,
             "image": image,
+            "backend": backend,
+            "session_endpoint": session_endpoint,
             "docker_probe_mode": docker_probe_mode,
             "host": host,
             "port": port,
@@ -142,7 +209,14 @@ def serve(
     docker_probe_mode = serve_config.docker_probe_mode
     host = serve_config.host
     port = serve_config.port
-    callback_url = serve_config.callback_url
+    # Allow deployments (e.g. Rise) to inject the externally-reachable controller
+    # URL via env when it isn't known at config-authoring time. As a last resort,
+    # derive it from the Rise-injected host of this controller container.
+    callback_url = serve_config.callback_url or os.environ.get("CLAUDIUS_CALLBACK_URL", "")
+    if not callback_url:
+        rise_self_host = os.environ.get("RISE_CONTAINER_HOST__CLAUDIUS", "").strip()
+        if rise_self_host:
+            callback_url = f"http://{rise_self_host}"
     attachments = serve_config.attachments
     log_conversation = serve_config.log_conversation
     proxy_upstream_kind = serve_config.upstream_llm.protocol
@@ -172,11 +246,17 @@ def serve(
     channels = {"email": channel}
     inbound_webhooks = {resend_provider.webhook_path: "email"}
 
-    backend = DockerBackend(
-        image=image,
-        workspaces_path=workspaces_path,
-        probe_mode=docker_probe_mode.lower(),
-    )
+    backend_kind = serve_config.backend
+    if backend_kind == "static":
+        from claudius.controller.backends.static import StaticBackend
+        backend = StaticBackend(session_endpoint=serve_config.session_endpoint)
+    else:
+        from claudius.controller.backends.docker import DockerBackend
+        backend = DockerBackend(
+            image=image,
+            workspaces_path=workspaces_path,
+            probe_mode=docker_probe_mode.lower(),
+        )
     broker = SSEBroker()
 
     async def run():
@@ -194,6 +274,7 @@ def serve(
         )
         logger.info(f"  workflows dir {serve_config.config_dir}")
         logger.info(f"  workspaces    {workspaces_path}")
+        logger.info(f"  backend       {backend_kind}")
         logger.info(f"  docker image  {image}")
         logger.info(f"  probe mode    {docker_probe_mode}")
         logger.info(f"  listen        {host}:{port}")
@@ -242,10 +323,12 @@ def serve(
             broker.close()
 
         watcher = asyncio.create_task(_close_broker_on_exit())
+        autostart_task = asyncio.create_task(_autostart_sessions(manager, workflows, backend))
         try:
             await server.serve()
         finally:
             watcher.cancel()
+            autostart_task.cancel()
             await manager.shutdown()
             await db.close()
 
@@ -330,6 +413,30 @@ def session(session_id, workspaces_path, host, port, idle_timeout):
             await server_task
 
     asyncio.run(run())
+
+
+@cli.command("session-pod")
+@click.option("--host", default="0.0.0.0", show_default=True)
+@click.option("--port", default=8080, show_default=True, type=int)
+@click.option("--runtime-host", default="127.0.0.1", show_default=True)
+@click.option("--runtime-port", default=8090, show_default=True, type=int)
+@click.option("--workspace-path", default=None,
+              help="Workspace directory (defaults to $CLAUDIUS_WORKSPACE_PATH or /workspace).")
+def session_pod(host, port, runtime_host, runtime_port, workspace_path):
+    """Run a long-lived session pod (worker + co-located runtime sidecar).
+
+    For static, pre-created deployments: the controller's static backend pushes
+    per-execution config to this pod's POST /configure endpoint.
+    """
+    from claudius.session.static import run_session_pod
+
+    run_session_pod(
+        host=host,
+        port=port,
+        runtime_host=runtime_host,
+        runtime_port=runtime_port,
+        workspace_path=workspace_path,
+    )
 
 
 @cli.command("runtime-sidecar")
