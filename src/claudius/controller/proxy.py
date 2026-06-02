@@ -12,6 +12,11 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 
 from claudius.controller.proxy_adapters import AnthropicAdapter, MessageFormatAdapter, OpenAIAdapter
+from claudius.controller.bedrock import (
+    BedrockUpstreamClient,
+    adapt_anthropic_to_bedrock_body,
+    bedrock_invoke_path,
+)
 
 _ALG = "HS256"
 _TTL_HOURS = 24
@@ -34,6 +39,7 @@ class ProxyUpstream:
         auth_mode: str,
         adapter: MessageFormatAdapter,
         model_pricing: dict[str, dict[str, float]] | None = None,
+        bedrock_client: "BedrockUpstreamClient | None" = None,
     ):
         self.kind = kind
         self.base_url = base_url.rstrip("/")
@@ -41,6 +47,14 @@ class ProxyUpstream:
         self.auth_mode = auth_mode
         self.adapter = adapter
         self.model_pricing = dict(model_pricing or {})
+        # Set when kind == "bedrock". The proxy hot path uses this instead of
+        # the generic httpx client so we don't have to teach the forwarder
+        # SigV4 + AWS event-stream framing.
+        self.bedrock_client = bedrock_client
+
+    @property
+    def is_bedrock(self) -> bool:
+        return self.kind == "bedrock"
 
     def url_for(self, path: str) -> str:
         return f"{self.base_url}/{path}"
@@ -103,8 +117,19 @@ def build_proxy_upstream(
     api_key: str,
     auth_mode: str = "none",
     model_pricing: dict[str, dict[str, float]] | None = None,
+    bedrock_region: str = "",
 ) -> ProxyUpstream:
-    adapter: MessageFormatAdapter = AnthropicAdapter() if kind == "anthropic" else OpenAIAdapter()
+    bedrock_client: BedrockUpstreamClient | None = None
+    if kind == "bedrock":
+        # Bedrock streams emerge from boto3 already shaped as Anthropic SSE,
+        # so the upstream adapter is the identity AnthropicAdapter — no body
+        # rewriting on the response side.
+        adapter: MessageFormatAdapter = AnthropicAdapter()
+        bedrock_client = BedrockUpstreamClient(region=bedrock_region)
+    elif kind == "anthropic":
+        adapter = AnthropicAdapter()
+    else:
+        adapter = OpenAIAdapter()
     return ProxyUpstream(
         kind=kind,
         base_url=base_url,
@@ -112,6 +137,7 @@ def build_proxy_upstream(
         auth_mode=auth_mode,
         adapter=adapter,
         model_pricing=model_pricing,
+        bedrock_client=bedrock_client,
     )
 
 
@@ -180,6 +206,18 @@ def _extract_request_model(body: bytes, content_type: str | None) -> str | None:
         return None
     model_name = payload.get("model")
     return model_name if isinstance(model_name, str) and model_name.strip() else None
+
+
+def _extract_request_streaming(body: bytes, content_type: str | None) -> bool:
+    """Anthropic Messages convention: clients set ``stream: true`` for SSE."""
+    content_type = (content_type or "").lower()
+    if _JSON_CT not in content_type or not body:
+        return False
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return False
+    return isinstance(payload, dict) and bool(payload.get("stream"))
 
 
 def _extract_usage_counts(body: bytes, content_type: str | None) -> dict[str, int] | None:
@@ -470,13 +508,26 @@ def create_proxy_routes(
         original_headers = dict(headers)
         original_body = body
         adapted_path, adapted_headers, adapted_body = upstream.adapter.adapt_request(path, headers, body)
-        request_model = _extract_request_model(adapted_body, adapted_headers.get("content-type"))
+        # For Bedrock the request shape changes again: drop "model" + "stream"
+        # from the body and remember them — boto3 takes them as separate args.
+        bedrock_streaming = False
+        bedrock_model_id: str | None = None
+        if upstream.is_bedrock:
+            bedrock_streaming = _extract_request_streaming(adapted_body, adapted_headers.get("content-type"))
+            adapted_body, bedrock_model_id = adapt_anthropic_to_bedrock_body(adapted_body)
+            request_model = bedrock_model_id
+        else:
+            request_model = _extract_request_model(adapted_body, adapted_headers.get("content-type"))
         try:
             request_model = upstream.ensure_known_model(request_model)
         except UnknownUpstreamModelError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        authed_headers = upstream.apply_auth(adapted_headers)
-        upstream_url = upstream.url_for(adapted_path)
+        authed_headers = upstream.apply_auth(adapted_headers) if not upstream.is_bedrock else adapted_headers
+        upstream_url = (
+            f"bedrock://{request_model or ''}{bedrock_invoke_path(request_model or '', streaming=bedrock_streaming)}"
+            if upstream.is_bedrock
+            else upstream.url_for(adapted_path)
+        )
         if log_conversation:
             await _record_proxy_log(
                 db,
@@ -509,35 +560,65 @@ def create_proxy_routes(
         headers, body = authed_headers, adapted_body
 
         logger.debug(f"proxy forwarding session_id={session_id} method={request.method} upstream={upstream_url}")
-        client = httpx.AsyncClient(timeout=httpx.Timeout(None))
-        try:
-            req = client.build_request(
-                method=request.method,
-                url=upstream_url,
-                headers=headers,
-                content=body,
-                params=dict(request.query_params),
-            )
-            resp = await client.send(req, stream=True)
-        except Exception as e:
-            if log_conversation:
-                await _record_proxy_log(
-                    db,
-                    broker,
-                    execution_id,
-                    session_id,
-                    stage="response_in",
-                    body=str(e),
-                    method=request.method,
-                    path=path,
-                    upstream_url=upstream_url,
-                    content_type="text/plain",
-                    meta={"transport_error": True},
-                    request_id=request_id,
+        client: httpx.AsyncClient | None = None
+        if upstream.is_bedrock:
+            # Bypass the generic httpx forwarder: boto3 handles SigV4 + AWS
+            # event-stream framing and we get back an httpx-shaped response.
+            assert upstream.bedrock_client is not None
+            try:
+                resp = await upstream.bedrock_client.invoke(
+                    model_id=bedrock_model_id or "",
+                    body=body,
+                    streaming=bedrock_streaming,
                 )
-            await client.aclose()
-            logger.warning(f"proxy upstream error session_id={session_id} upstream={upstream_url} error={e!r}")
-            raise HTTPException(status_code=502, detail="Upstream unreachable")
+            except Exception as e:
+                logger.warning(f"proxy bedrock error session_id={session_id} model={bedrock_model_id!r} error={e!r}")
+                if log_conversation:
+                    await _record_proxy_log(
+                        db,
+                        broker,
+                        execution_id,
+                        session_id,
+                        stage="response_in",
+                        body=str(e),
+                        method=request.method,
+                        path=path,
+                        upstream_url=upstream_url,
+                        content_type="text/plain",
+                        meta={"transport_error": True},
+                        request_id=request_id,
+                    )
+                raise HTTPException(status_code=502, detail="Upstream unreachable")
+        else:
+            client = httpx.AsyncClient(timeout=httpx.Timeout(None))
+            try:
+                req = client.build_request(
+                    method=request.method,
+                    url=upstream_url,
+                    headers=headers,
+                    content=body,
+                    params=dict(request.query_params),
+                )
+                resp = await client.send(req, stream=True)
+            except Exception as e:
+                if log_conversation:
+                    await _record_proxy_log(
+                        db,
+                        broker,
+                        execution_id,
+                        session_id,
+                        stage="response_in",
+                        body=str(e),
+                        method=request.method,
+                        path=path,
+                        upstream_url=upstream_url,
+                        content_type="text/plain",
+                        meta={"transport_error": True},
+                        request_id=request_id,
+                    )
+                await client.aclose()
+                logger.warning(f"proxy upstream error session_id={session_id} upstream={upstream_url} error={e!r}")
+                raise HTTPException(status_code=502, detail="Upstream unreachable")
 
         if resp.status_code >= 400:
             error_body = await resp.aread()
@@ -574,7 +655,8 @@ def create_proxy_routes(
                     request_id=request_id,
                 )
             await resp.aclose()
-            await client.aclose()
+            if client is not None:
+                await client.aclose()
             logger.warning(
                 f"proxy upstream error session_id={session_id} upstream={upstream_url} "
                 f"status={resp.status_code} body={error_body.decode(errors='replace')[:500]}"
@@ -685,6 +767,7 @@ def create_proxy_routes(
                         request_id=request_id,
                     )
                 await resp.aclose()
-                await client.aclose()
+                if client is not None:
+                    await client.aclose()
 
         return StreamingResponse(body_iter(), status_code=resp.status_code, headers=resp_headers)

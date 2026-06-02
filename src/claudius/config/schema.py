@@ -12,12 +12,14 @@ DOCKER_PROBE_MODES = (
 UPSTREAM_PROTOCOL_KINDS = (
     "anthropic",
     "openai",
+    "bedrock",
 )
 UPSTREAM_AUTH_MODES = (
     "x-api-key",
     "bearer",
     "none",
     "oauth",
+    "sigv4",
 )
 _BUILTIN_TOOL_NAMES = {
     "bash",
@@ -287,6 +289,17 @@ class OAuthUpstreamConfig(BaseModel):
     scopes: str = ""
 
 
+class BedrockUpstreamConfig(BaseModel):
+    """Settings for ``protocol: bedrock`` (Anthropic-on-AWS-Bedrock).
+
+    AWS credentials are resolved via the standard boto3 chain (env vars, IAM
+    role, ``~/.aws/credentials``, …) so no key fields are needed here. Region
+    falls back to ``AWS_REGION`` / ``AWS_DEFAULT_REGION`` when omitted.
+    """
+
+    region: str = ""
+
+
 class UpstreamLLMConfig(BaseModel):
     protocol: str = "anthropic"
     base_url: str = ""
@@ -294,6 +307,7 @@ class UpstreamLLMConfig(BaseModel):
     auth_mode: str | None = None
     model_pricing: dict[str, UpstreamModelPricingConfig] = Field(default_factory=dict)
     oauth: OAuthUpstreamConfig = Field(default_factory=OAuthUpstreamConfig)
+    bedrock: BedrockUpstreamConfig = Field(default_factory=BedrockUpstreamConfig)
 
     @property
     def is_oauth(self) -> bool:
@@ -309,6 +323,25 @@ class UpstreamLLMConfig(BaseModel):
             )
         self.base_url = self.base_url.strip()
         self.api_key_env = self.api_key_env.strip()
+        if self.protocol == "bedrock":
+            # Bedrock implies sigv4 (the only sensible auth) and uses the
+            # bedrock-runtime SDK rather than a plain HTTP forwarder, so it
+            # has no base_url / api_key_env. Fail loud on accidental config.
+            if self.auth_mode is None:
+                self.auth_mode = "sigv4"
+            elif self.auth_mode.strip().lower() != "sigv4":
+                raise ValueError(
+                    "upstream_llm.auth_mode for protocol 'bedrock' must be 'sigv4'"
+                )
+            if self.base_url:
+                raise ValueError(
+                    "upstream_llm.base_url is not used with protocol 'bedrock'"
+                )
+            if self.api_key_env:
+                raise ValueError(
+                    "upstream_llm.api_key_env is not used with protocol 'bedrock'"
+                )
+            self.bedrock.region = self.bedrock.region.strip()
         if self.auth_mode is None:
             return self
         self.auth_mode = self.auth_mode.strip().lower()
@@ -319,6 +352,8 @@ class UpstreamLLMConfig(BaseModel):
             )
         if self.auth_mode == "oauth" and self.protocol != "anthropic":
             raise ValueError("upstream_llm.auth_mode 'oauth' requires protocol 'anthropic'")
+        if self.auth_mode == "sigv4" and self.protocol != "bedrock":
+            raise ValueError("upstream_llm.auth_mode 'sigv4' requires protocol 'bedrock'")
         normalized_model_pricing: dict[str, UpstreamModelPricingConfig] = {}
         for model_name, pricing in self.model_pricing.items():
             normalized_name = model_name.strip()

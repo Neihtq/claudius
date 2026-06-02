@@ -236,6 +236,7 @@ def serve(
             model_name: pricing.model_dump()
             for model_name, pricing in serve_config.upstream_llm.model_pricing.items()
         },
+        bedrock_region=serve_config.upstream_llm.bedrock.region,
     )
 
     email_channel_config = serve_config.channels.email
